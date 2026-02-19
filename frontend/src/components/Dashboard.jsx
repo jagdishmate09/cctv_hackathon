@@ -1,0 +1,785 @@
+import { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import '../styles/dashboard.css';
+
+function Dashboard() {
+    const navigate = useNavigate();
+    const [selectedCamera, setSelectedCamera] = useState('Select Camera');
+    const [isStreaming, setIsStreaming] = useState(false);
+    const [availableCameras, setAvailableCameras] = useState([]);
+    const [videoMode, setVideoMode] = useState('camera'); // 'camera' or 'file'
+    const [selectedVideoFile, setSelectedVideoFile] = useState(null);
+    const [videoFileUrl, setVideoFileUrl] = useState(null);
+    const [detectionData, setDetectionData] = useState({
+        count: 0,
+        detections: [],
+        stats: null
+    });
+    const [isDetecting, setIsDetecting] = useState(false);
+    const [backendConnected, setBackendConnected] = useState(false);
+    const [detectionError, setDetectionError] = useState(null);
+    const videoRef = useRef(null);
+    const streamRef = useRef(null);
+    const fileInputRef = useRef(null);
+    const detectionIntervalRef = useRef(null);
+
+    useEffect(() => {
+        // Get available cameras on component mount
+        getAvailableCameras();
+        
+        // Check backend connection
+        checkBackendConnection();
+        
+        // Cleanup on unmount
+        return () => {
+            if (streamRef.current) {
+                streamRef.current.getTracks().forEach(track => track.stop());
+            }
+            if (videoFileUrl) {
+                URL.revokeObjectURL(videoFileUrl);
+            }
+            if (detectionIntervalRef.current) {
+                clearInterval(detectionIntervalRef.current);
+                detectionIntervalRef.current = null;
+            }
+        };
+    }, [videoFileUrl]);
+
+    // Auto-start detection when streaming begins
+    useEffect(() => {
+        if (isStreaming && videoRef.current) {
+            console.log('[Effect] Streaming started, setting up detection...');
+            // Wait a bit for video to be ready
+            const timer = setTimeout(() => {
+                if (videoRef.current && videoRef.current.readyState >= 2) {
+                    console.log('[Effect] Video ready, starting detection');
+                    startDetection();
+                } else {
+                    console.log('[Effect] Video not ready yet, will retry');
+                    // Retry after a short delay
+                    setTimeout(() => {
+                        if (videoRef.current && videoRef.current.readyState >= 2) {
+                            startDetection();
+                        }
+                    }, 500);
+                }
+            }, 500);
+            
+            return () => clearTimeout(timer);
+        } else if (!isStreaming) {
+            // Stop detection when streaming stops
+            if (detectionIntervalRef.current) {
+                console.log('[Effect] Streaming stopped, clearing detection interval');
+                clearInterval(detectionIntervalRef.current);
+                detectionIntervalRef.current = null;
+            }
+        }
+    }, [isStreaming]);
+
+    const checkBackendConnection = async () => {
+        try {
+            const response = await fetch('http://localhost:5000/api/health', {
+                method: 'GET',
+                timeout: 3000
+            });
+            if (response.ok) {
+                const data = await response.json();
+                setBackendConnected(data.detector_ready || false);
+                setDetectionError(null);
+            } else {
+                setBackendConnected(false);
+                setDetectionError('Backend server responded with error');
+            }
+        } catch (error) {
+            setBackendConnected(false);
+            setDetectionError('Cannot connect to backend server. Make sure it is running on http://localhost:5000');
+            console.error('Backend connection error:', error);
+        }
+    };
+
+    const getAvailableCameras = async () => {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoDevices = devices.filter(device => device.kind === 'videoinput');
+            
+            const cameraList = ['Select Camera', ...videoDevices.map(device => 
+                device.label || `Camera ${videoDevices.indexOf(device) + 1}`
+            )];
+            
+            setAvailableCameras(cameraList);
+        } catch (error) {
+            console.error('Error getting cameras:', error);
+            // Fallback to default cameras
+            setAvailableCameras([
+                'Select Camera',
+                'HD User Facing (04f2:b72b)',
+                'Camera 2',
+                'Camera 3'
+            ]);
+        }
+    };
+
+    const handleFileSelect = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            // Clean up previous file URL if exists
+            if (videoFileUrl) {
+                URL.revokeObjectURL(videoFileUrl);
+            }
+            
+            // Stop camera if running
+            if (streamRef.current) {
+                streamRef.current.getTracks().forEach(track => track.stop());
+                streamRef.current = null;
+            }
+            
+            const url = URL.createObjectURL(file);
+            setSelectedVideoFile(file);
+            setVideoFileUrl(url);
+            setVideoMode('file');
+            
+            if (videoRef.current) {
+                videoRef.current.srcObject = null;
+                videoRef.current.src = url;
+                videoRef.current.load();
+                
+                // Wait for video to be ready
+                videoRef.current.onloadedmetadata = () => {
+                    console.log('Video file metadata loaded');
+                    videoRef.current.play().catch(err => {
+                        console.error('Error playing video file:', err);
+                    });
+                };
+                
+                videoRef.current.oncanplay = () => {
+                    console.log('Video file can play');
+                };
+            }
+            
+            setIsStreaming(true);
+            // Start detection after video loads (faster)
+            setTimeout(() => {
+                startDetection();
+            }, 500);
+        }
+    };
+
+    const handleStart = async () => {
+        if (videoMode === 'file' && videoFileUrl) {
+            // Resume file playback
+            if (videoRef.current) {
+                videoRef.current.play().catch(err => {
+                    console.error('Error playing video:', err);
+                });
+            }
+            setIsStreaming(true);
+            // Start detection for file mode (faster)
+            setTimeout(() => {
+                startDetection();
+            }, 500);
+            return;
+        }
+
+        // Camera mode
+        console.log('Starting camera feed...');
+
+        try {
+            // Try with ideal constraints first
+            let constraints = {
+                video: {
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
+                audio: false
+            };
+
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+            } catch (err) {
+                // Fallback to basic constraints if ideal fails
+                console.log('Trying with basic constraints...');
+                constraints = {
+                    video: true,
+                    audio: false
+                };
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+            }
+
+            streamRef.current = stream;
+            setVideoMode('camera');
+            
+            // Clean up file if switching from file to camera
+            if (videoFileUrl) {
+                URL.revokeObjectURL(videoFileUrl);
+                setVideoFileUrl(null);
+                setSelectedVideoFile(null);
+            }
+            
+            if (videoRef.current) {
+                videoRef.current.src = '';
+                videoRef.current.srcObject = stream;
+                
+                // Wait for video to be ready
+                videoRef.current.onloadedmetadata = () => {
+                    console.log('Video metadata loaded');
+                    videoRef.current.play().catch(err => {
+                        console.error('Error playing video:', err);
+                    });
+                };
+
+                videoRef.current.onplay = () => {
+                    console.log('Video is playing');
+                };
+
+                videoRef.current.onerror = (e) => {
+                    console.error('Video element error:', e);
+                };
+            }
+            
+            setIsStreaming(true);
+            console.log('Video feed started successfully');
+            // Start detection after state updates and video is ready (faster)
+            setTimeout(() => {
+                startDetection();
+            }, 500);
+        } catch (error) {
+            console.error('Error accessing camera:', error);
+            let errorMessage = 'Error accessing camera. ';
+            if (error.name === 'NotAllowedError') {
+                errorMessage += 'Please allow camera access in your browser settings.';
+            } else if (error.name === 'NotFoundError') {
+                errorMessage += 'No camera found. Please connect a camera.';
+            } else if (error.name === 'NotReadableError') {
+                errorMessage += 'Camera is being used by another application.';
+            } else {
+                errorMessage += error.message;
+            }
+            alert(errorMessage);
+        }
+    };
+
+    const handleStop = () => {
+        if (videoMode === 'camera' && streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
+        
+        if (videoRef.current) {
+            if (videoMode === 'camera') {
+                videoRef.current.srcObject = null;
+            } else {
+                videoRef.current.pause();
+                videoRef.current.currentTime = 0;
+            }
+        }
+        
+        setIsStreaming(false);
+        stopDetection();
+        console.log('Video feed stopped');
+    };
+
+    const handleModeSwitch = (mode) => {
+        // Stop current feed
+        handleStop();
+        
+        // Clear file selection if switching to camera
+        if (mode === 'camera' && videoFileUrl) {
+            URL.revokeObjectURL(videoFileUrl);
+            setVideoFileUrl(null);
+            setSelectedVideoFile(null);
+            if (fileInputRef.current) {
+                fileInputRef.current.value = '';
+            }
+        }
+        
+        setVideoMode(mode);
+    };
+
+    const handleSnapshot = () => {
+        if (!videoRef.current || !isStreaming) return;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(videoRef.current, 0, 0);
+        
+        canvas.toBlob((blob) => {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `snapshot-${Date.now()}.png`;
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+        
+        console.log('Snapshot taken');
+    };
+
+    const captureFrameForDetection = () => {
+        if (!videoRef.current || !isStreaming) {
+            console.log('Cannot capture: video not ready or not streaming');
+            return null;
+        }
+        
+        // Check if video is actually ready and has dimensions
+        if (videoRef.current.readyState < 2 || 
+            videoRef.current.videoWidth === 0 || 
+            videoRef.current.videoHeight === 0) {
+            console.log('Video not ready for capture');
+            return null;
+        }
+        
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = videoRef.current.videoWidth;
+            canvas.height = videoRef.current.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(videoRef.current, 0, 0);
+            
+            // Use lower quality (0.6) for faster processing and smaller payload
+            return canvas.toDataURL('image/jpeg', 0.6);
+        } catch (error) {
+            console.error('Error capturing frame:', error);
+            return null;
+        }
+    };
+
+    const detectPeople = async () => {
+        // Skip if already detecting or not streaming
+        if (!isStreaming || isDetecting) {
+            return; // Silently skip to avoid console spam
+        }
+        
+        const frameBase64 = captureFrameForDetection();
+        if (!frameBase64) {
+            console.log('No frame captured for detection');
+            return;
+        }
+        
+        console.log('Starting detection - frame size:', frameBase64.length, 'bytes');
+        setIsDetecting(true);
+        
+        try {
+            const requestBody = {
+                frame: frameBase64,
+                conf_threshold: 0.25  // Lower threshold for better detection in blurred videos
+            };
+            
+            console.log('Sending detection request to API...');
+            const response = await fetch('http://localhost:5000/api/detect', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(requestBody)
+            });
+            
+            console.log('API Response status:', response.status);
+            
+            if (response.ok) {
+                const data = await response.json();
+                console.log('Detection response:', data);
+                console.log('People detected:', data.count);
+                console.log('Detections:', data.detections);
+                
+                if (data.success !== false) {
+                    setDetectionData({
+                        count: data.count || 0,
+                        detections: data.detections || [],
+                        stats: data.stats || null
+                    });
+                    setDetectionError(null);
+                    setBackendConnected(true);
+                } else {
+                    console.error('Detection failed:', data.error);
+                    setDetectionError(data.error || 'Detection failed');
+                    setDetectionData(prev => ({
+                        ...prev,
+                        count: 0
+                    }));
+                }
+            } else {
+                const errorText = await response.text();
+                console.error('Detection API error:', response.status, errorText);
+                try {
+                    const errorData = JSON.parse(errorText);
+                    setDetectionError(`API Error: ${response.status} - ${errorData.error || errorText}`);
+                } catch {
+                    setDetectionError(`API Error: ${response.status} - ${errorText}`);
+                }
+                setDetectionData(prev => ({
+                    ...prev,
+                    count: 0
+                }));
+            }
+        } catch (error) {
+            console.error('Error detecting people:', error);
+            console.error('Error details:', error.message);
+            console.error('Error stack:', error.stack);
+            
+            if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+                setDetectionError('Cannot connect to backend. Make sure server is running on http://localhost:5000');
+                setBackendConnected(false);
+            } else {
+                setDetectionError(`Detection error: ${error.message}`);
+            }
+            
+            setDetectionData(prev => ({
+                ...prev,
+                count: 0
+            }));
+        } finally {
+            setIsDetecting(false);
+        }
+    };
+
+    const startDetection = () => {
+        // Clear any existing interval
+        if (detectionIntervalRef.current) {
+            clearInterval(detectionIntervalRef.current);
+            detectionIntervalRef.current = null;
+        }
+        
+        console.log('Starting detection interval...');
+        
+        // Function to check and run detection - uses current refs/state
+        const runDetectionIfReady = () => {
+            // Check current streaming state from ref (more reliable)
+            const currentVideo = videoRef.current;
+            if (!currentVideo) {
+                console.log('[Auto] No video element');
+                return false;
+            }
+            
+            // Check video readiness - be more lenient
+            const readyState = currentVideo.readyState;
+            const hasDimensions = currentVideo.videoWidth > 0 && currentVideo.videoHeight > 0;
+            const isPlaying = !currentVideo.paused && !currentVideo.ended;
+            
+            // Video is ready if it has metadata loaded and dimensions
+            if (readyState >= 2 && hasDimensions) {
+                console.log(`[Auto] Video ready (state: ${readyState}, ${currentVideo.videoWidth}x${currentVideo.videoHeight}), triggering detection`);
+                detectPeople();
+                return true;
+            } else {
+                console.log(`[Auto] Video not ready - readyState: ${readyState}, dimensions: ${currentVideo.videoWidth}x${currentVideo.videoHeight}, playing: ${isPlaying}`);
+            }
+            return false;
+        };
+        
+        // Try immediately after a very short delay
+        setTimeout(() => {
+            runDetectionIfReady();
+        }, 300);
+        
+        // Set up interval - run every 500ms (0.5 seconds) for fast detection
+        detectionIntervalRef.current = setInterval(() => {
+            runDetectionIfReady();
+        }, 500);
+        
+        console.log('Automatic detection interval active - running every 500ms (fast mode)');
+    };
+
+    const stopDetection = () => {
+        if (detectionIntervalRef.current) {
+            clearInterval(detectionIntervalRef.current);
+            detectionIntervalRef.current = null;
+        }
+        setDetectionData({
+            count: 0,
+            detections: [],
+            stats: null
+        });
+    };
+
+    return (
+        <div className="dashboard-container">
+            <div className="dashboard-top-bar">
+                <div className="logo-section">
+                    <img 
+                        src="/images/logo (2).png" 
+                        alt="DPA Logo" 
+                        className="logo-image"
+                    />
+                </div>
+                <div className="header-bar">
+                    <button 
+                        className="logout-btn"
+                        onClick={() => {
+                            // Stop all streams and cleanup
+                            if (streamRef.current) {
+                                streamRef.current.getTracks().forEach(track => track.stop());
+                            }
+                            if (detectionIntervalRef.current) {
+                                clearInterval(detectionIntervalRef.current);
+                            }
+                            // Navigate to login
+                            navigate('/');
+                        }}
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                            <polyline points="16 17 21 12 16 7"></polyline>
+                            <line x1="21" y1="12" x2="9" y2="12"></line>
+                        </svg>
+                        <span>Logout</span>
+                    </button>
+                </div>
+            </div>
+
+            <div className="dashboard-content">
+                {/* Left Panel - Parameters (for future use) */}
+                <div className="left-panel">
+                    <div className="panel-header">
+                        <h2>PARAMETERS</h2>
+                    </div>
+                    <div className="panel-content">
+                        <p className="placeholder-text">Parameters will be added here</p>
+                    </div>
+                </div>
+
+                {/* Center Panel - Video Feed */}
+                <div className="center-panel">
+                    <div className="video-controls">
+                        <div className="mode-selector">
+                            <label>Video Source</label>
+                            <div className="mode-toggle">
+                                <button
+                                    className={`mode-btn ${videoMode === 'camera' ? 'active' : ''}`}
+                                    onClick={() => handleModeSwitch('camera')}
+                                >
+                                    Camera
+                                </button>
+                                <button
+                                    className={`mode-btn ${videoMode === 'file' ? 'active' : ''}`}
+                                    onClick={() => handleModeSwitch('file')}
+                                >
+                                    File
+                                </button>
+                            </div>
+                        </div>
+                        
+                        {videoMode === 'camera' ? (
+                            <div className="camera-selector">
+                                <label htmlFor="cameraSelect">Select Camera</label>
+                                <select 
+                                    id="cameraSelect"
+                                    value={selectedCamera}
+                                    onChange={(e) => setSelectedCamera(e.target.value)}
+                                    className="camera-dropdown"
+                                >
+                                    {availableCameras.map((camera, index) => (
+                                        <option key={index} value={camera}>
+                                            {camera}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        ) : (
+                            <div className="file-selector">
+                                <label htmlFor="videoFileInput">Select Video File</label>
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    id="videoFileInput"
+                                    accept="video/*"
+                                    onChange={handleFileSelect}
+                                    style={{ display: 'none' }}
+                                />
+                                <button
+                                    className="control-btn file-btn"
+                                    onClick={() => fileInputRef.current?.click()}
+                                >
+                                    {selectedVideoFile ? selectedVideoFile.name : 'Choose File'}
+                                </button>
+                            </div>
+                        )}
+                        
+                        <div className="control-buttons">
+                            <button 
+                                className="control-btn start-btn" 
+                                onClick={handleStart}
+                                disabled={isStreaming || (videoMode === 'file' && !selectedVideoFile)}
+                            >
+                                Start
+                            </button>
+                            <button 
+                                className="control-btn stop-btn" 
+                                onClick={handleStop}
+                                disabled={!isStreaming}
+                            >
+                                Stop
+                            </button>
+                            <button 
+                                className="control-btn snapshot-btn" 
+                                onClick={handleSnapshot}
+                                disabled={!isStreaming}
+                            >
+                                Snapshot
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="video-feed-container">
+                        <div className={`video-feed ${!isStreaming ? 'video-feed-disconnected' : ''}`}>
+                            <video
+                                ref={videoRef}
+                                autoPlay
+                                playsInline
+                                muted={videoMode === 'camera'}
+                                controls={videoMode === 'file'}
+                                className="video-element"
+                                style={{ display: isStreaming ? 'block' : 'none' }}
+                                onError={(e) => {
+                                    console.error('Video error:', e);
+                                    alert('Error loading video. Please try again.');
+                                }}
+                            />
+                            {!isStreaming && (
+                                <div className="video-placeholder">
+                                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                        <path d="M23 7l-7 5 7 5V7z" />
+                                        <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                                    </svg>
+                                    <p>{videoMode === 'camera' ? 'Camera: Disconnected' : 'No Video File Selected'}</p>
+                                    <p className="video-instruction">
+                                        {videoMode === 'camera' 
+                                            ? 'Camera Not Started. Select camera and click Start. Snapshot feature available.'
+                                            : 'No video file selected. Click "Choose File" to select a video file from your system.'
+                                        }
+                                    </p>
+                                </div>
+                            )}
+                            {isStreaming && (
+                                <div className="video-overlay">
+                                    <p>Video Feed Active</p>
+                                    <p className="video-status">
+                                        {videoMode === 'camera' 
+                                            ? `Camera: ${selectedCamera === 'Select Camera' ? 'Default Camera' : selectedCamera}`
+                                            : `File: ${selectedVideoFile?.name || 'Video File'}`
+                                        }
+                                    </p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Right Panel - People Detection */}
+                <div className="right-panel">
+                    <div className="panel-header">
+                        <h2>SYSTEM STATUS</h2>
+                    </div>
+                    <div className="panel-content">
+                        <div className="detection-section">
+                            <div className="detection-card">
+                                <div className="detection-icon">
+                                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                        <circle cx="9" cy="7" r="4"></circle>
+                                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                    </svg>
+                                </div>
+                                <div className="detection-count">
+                                    <div className="count-number">{detectionData.count}</div>
+                                    <div className="count-label">People Detected</div>
+                                </div>
+                            </div>
+
+                            {!backendConnected && (
+                                <div className="detection-status">
+                                    <div className="status-indicator-small error">
+                                        <span className="status-dot"></span>
+                                        <span>Backend Offline</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {backendConnected && isStreaming && (
+                                <div className="detection-status">
+                                    <div className={`status-indicator-small ${isDetecting ? 'detecting' : 'idle'}`}>
+                                        <span className="status-dot"></span>
+                                        <span>{isDetecting ? 'Detecting...' : 'Monitoring'}</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {detectionError && (
+                                <div className="detection-error">
+                                    <p>{detectionError}</p>
+                                    <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '8px' }}>
+                                        <button 
+                                            className="retry-btn"
+                                            onClick={checkBackendConnection}
+                                        >
+                                            Retry Connection
+                                        </button>
+                                        <button 
+                                            className="retry-btn"
+                                            onClick={() => {
+                                                console.log('Manual detection test');
+                                                detectPeople();
+                                            }}
+                                        >
+                                            Test Detection
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {isStreaming && !detectionError && (
+                                <div style={{ textAlign: 'center', marginTop: '12px' }}>
+                                    <button 
+                                        className="control-btn"
+                                        onClick={() => {
+                                            console.log('Manual detection trigger');
+                                            detectPeople();
+                                        }}
+                                        style={{ fontSize: '12px', padding: '8px 16px' }}
+                                    >
+                                        Test Detection Now
+                                    </button>
+                                </div>
+                            )}
+
+                            {detectionData.stats && detectionData.count > 0 && (
+                                <div className="detection-stats">
+                                    <div className="stat-item">
+                                        <span className="stat-label">Avg Confidence:</span>
+                                        <span className="stat-value">{(detectionData.stats.avg_confidence * 100).toFixed(1)}%</span>
+                                    </div>
+                                    <div className="stat-item">
+                                        <span className="stat-label">Max Confidence:</span>
+                                        <span className="stat-value">{(detectionData.stats.max_confidence * 100).toFixed(1)}%</span>
+                                    </div>
+                                    <div className="stat-item">
+                                        <span className="stat-label">Min Confidence:</span>
+                                        <span className="stat-value">{(detectionData.stats.min_confidence * 100).toFixed(1)}%</span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {!isStreaming && (
+                                <div className="detection-message">
+                                    <p>Start video feed to begin people detection</p>
+                                </div>
+                            )}
+
+                            {isStreaming && detectionData.count === 0 && !isDetecting && (
+                                <div className="detection-message">
+                                    <p>No people detected in current frame</p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+export default Dashboard;
+
