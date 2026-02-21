@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, redirect
 from flask_cors import CORS
+from itsdangerous import URLSafeTimedSerializer
 import base64
 import json
 import numpy as np
@@ -9,7 +10,20 @@ import sys
 import tempfile
 import subprocess
 import shutil
+import urllib.parse
+import requests
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Microsoft SSO (OAuth 2.0) config from env
+MICROSOFT_CLIENT_ID = os.environ.get('MICROSOFT_CLIENT_ID', '')
+MICROSOFT_CLIENT_SECRET = os.environ.get('MICROSOFT_CLIENT_SECRET', '')
+MICROSOFT_TENANT_ID = os.environ.get('MICROSOFT_TENANT_ID', 'common')
+REDIRECT_URI = os.environ.get('REDIRECT_URI', 'http://localhost:5000/auth/microsoft/callback')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
+SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
 
 # Try to import PeopleDetector, but allow server to start even if it fails
 try:
@@ -22,7 +36,102 @@ except Exception as e:
     DETECTOR_AVAILABLE = False
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend communication
+app.config['SECRET_KEY'] = SECRET_KEY
+CORS(app, supports_credentials=True)  # Allow credentials for same-origin frontend
+
+# Session token signer for SSO (signed payload, max 24h)
+def _get_signer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='sso-session')
+
+# -----------------------------------------------------------------------------
+# Microsoft SSO (OAuth 2.0 authorization code flow)
+# -----------------------------------------------------------------------------
+AUTH_SCOPES = 'openid profile email'
+AUTH_BASE = f'https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0'
+AUTH_URL = f'{AUTH_BASE}/authorize'
+TOKEN_URL = f'{AUTH_BASE}/token'
+GRAPH_ME = 'https://graph.microsoft.com/v1.0/me'
+
+
+@app.route('/auth/microsoft')
+def auth_microsoft():
+    """Redirect user to Microsoft sign-in."""
+    if not MICROSOFT_CLIENT_ID:
+        return jsonify({'error': 'Microsoft SSO not configured (MICROSOFT_CLIENT_ID missing)'}), 500
+    params = {
+        'client_id': MICROSOFT_CLIENT_ID,
+        'response_type': 'code',
+        'redirect_uri': REDIRECT_URI,
+        'scope': AUTH_SCOPES,
+        'response_mode': 'query',
+    }
+    url = AUTH_URL + '?' + urllib.parse.urlencode(params)
+    return redirect(url)
+
+
+@app.route('/auth/microsoft/callback')
+def auth_microsoft_callback():
+    """Handle redirect from Microsoft: exchange code for tokens, create session, redirect to frontend."""
+    code = request.args.get('code')
+    error = request.args.get('error')
+    if error:
+        return redirect(f"{FRONTEND_URL}/login?error=" + urllib.parse.quote(error))
+    if not code:
+        return redirect(f"{FRONTEND_URL}/login?error=no_code")
+    if not MICROSOFT_CLIENT_ID or not MICROSOFT_CLIENT_SECRET:
+        return redirect(f"{FRONTEND_URL}/login?error=server_config")
+
+    data = {
+        'client_id': MICROSOFT_CLIENT_ID,
+        'client_secret': MICROSOFT_CLIENT_SECRET,
+        'code': code,
+        'redirect_uri': REDIRECT_URI,
+        'grant_type': 'authorization_code',
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    try:
+        r = requests.post(TOKEN_URL, data=data, headers=headers, timeout=15)
+        r.raise_for_status()
+        token_json = r.json()
+    except Exception as e:
+        print(f"[Auth] Token exchange failed: {e}")
+        return redirect(f"{FRONTEND_URL}/login?error=token_exchange")
+
+    access_token = token_json.get('access_token')
+    if not access_token:
+        return redirect(f"{FRONTEND_URL}/login?error=no_token")
+
+    try:
+        me = requests.get(GRAPH_ME, headers={'Authorization': f'Bearer {access_token}'}, timeout=10)
+        me.raise_for_status()
+        user = me.json()
+    except Exception as e:
+        print(f"[Auth] Graph me failed: {e}")
+        user = {}
+
+    payload = {
+        'sub': user.get('id') or token_json.get('oid'),
+        'email': user.get('mail') or user.get('userPrincipalName') or '',
+        'name': user.get('displayName') or '',
+    }
+    signer = _get_signer()
+    session_token = signer.dumps(payload)
+    return redirect(f"{FRONTEND_URL}/dashboard?token=" + urllib.parse.quote(session_token))
+
+
+@app.route('/auth/verify', methods=['GET'])
+def auth_verify():
+    """Verify a session token (e.g. from frontend). Returns user info if valid."""
+    token = request.args.get('token') or (request.get_json() or {}).get('token')
+    if not token:
+        return jsonify({'valid': False, 'error': 'missing token'}), 401
+    signer = _get_signer()
+    try:
+        payload = signer.loads(token, max_age=86400)  # 24 hours
+        return jsonify({'valid': True, 'user': payload})
+    except Exception:
+        return jsonify({'valid': False, 'error': 'invalid or expired token'}), 401
+
 
 # Initialize people detector
 detector = None

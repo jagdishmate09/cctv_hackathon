@@ -109,10 +109,22 @@ Ensure the backend URL in the frontend (e.g. in env or config) matches where the
 
 ---
 
-## 4. Optional: environment variables
+## 4. Microsoft SSO (required for login)
 
-- Backend: create `backend/.env` if you need to override port or other settings (see `python-dotenv` usage in the app).
-- Frontend: use `.env` in `frontend/` for any `VITE_*` variables if your app reads them.
+Login uses **Microsoft SSO only** (no username/password). Configure these in `backend/.env` (copy from `backend/.env.example`):
+
+| Variable | Description |
+|----------|-------------|
+| `MICROSOFT_CLIENT_ID` | Application (client) ID from your Azure App registration |
+| `MICROSOFT_CLIENT_SECRET` | Client secret from Azure → Certificates & secrets |
+| `MICROSOFT_TENANT_ID` | Azure AD tenant ID, or `common` for multi-tenant |
+| `REDIRECT_URI` | Must match Azure (e.g. `http://localhost:5000/auth/microsoft/callback`) |
+| `FRONTEND_URL` | Frontend URL after login (e.g. `http://localhost:5173`) |
+| `SECRET_KEY` | Strong random secret for signing session tokens (change in production) |
+
+**Azure setup:** Azure Portal → Azure Active Directory → App registrations → New registration. Under **Authentication**, add a Web redirect URI: `http://localhost:5000/auth/microsoft/callback`. Under **Certificates & secrets**, create a client secret and set the variables above.
+
+- Frontend: use `.env` in `frontend/` for `VITE_API_URL` if your API is not at `http://localhost:5000`.
 
 ---
 

@@ -1,9 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import '../styles/dashboard.css';
+
+const SSO_TOKEN_KEY = 'sso_token';
 
 function Dashboard() {
     const navigate = useNavigate();
+    const [searchParams, setSearchParams] = useSearchParams();
     const [selectedCamera, setSelectedCamera] = useState('Select Camera');
     const [isStreaming, setIsStreaming] = useState(false);
     const [availableCameras, setAvailableCameras] = useState([]);
@@ -28,6 +31,23 @@ function Dashboard() {
     const fileInputRef = useRef(null);
     const detectionIntervalRef = useRef(null);
     const davAbortControllerRef = useRef(null);
+
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        const token = params.get('token');
+        if (token) {
+            sessionStorage.setItem(SSO_TOKEN_KEY, token);
+            params.delete('token');
+            const newSearch = params.toString();
+            const newPath = window.location.pathname + (newSearch ? '?' + newSearch : '');
+            window.history.replaceState({}, '', newPath);
+            setSearchParams(params);
+        }
+        if (!sessionStorage.getItem(SSO_TOKEN_KEY)) {
+            navigate('/login', { replace: true });
+            return;
+        }
+    }, [navigate, setSearchParams]);
 
     useEffect(() => {
         // Get available cameras on component mount
@@ -634,25 +654,20 @@ function Dashboard() {
         <div className="dashboard-container">
             <div className="dashboard-top-bar">
                 <div className="logo-section">
-                    <img 
-                        src="/images/logo (2).png" 
-                        alt="DPA Logo" 
-                        className="logo-image"
-                    />
+                    <span className="logo-text">IntelliSpace AI</span>
                 </div>
                 <div className="header-bar">
                     <button 
                         className="logout-btn"
                         onClick={() => {
-                            // Stop all streams and cleanup
                             if (streamRef.current) {
                                 streamRef.current.getTracks().forEach(track => track.stop());
                             }
                             if (detectionIntervalRef.current) {
                                 clearInterval(detectionIntervalRef.current);
                             }
-                            // Navigate to login
-                            navigate('/');
+                            sessionStorage.removeItem(SSO_TOKEN_KEY);
+                            navigate('/login', { replace: true });
                         }}
                     >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
