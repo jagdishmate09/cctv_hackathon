@@ -18,10 +18,16 @@ function Dashboard() {
     const [isDetecting, setIsDetecting] = useState(false);
     const [backendConnected, setBackendConnected] = useState(false);
     const [detectionError, setDetectionError] = useState(null);
+    const [davProcessing, setDavProcessing] = useState(false);
+    const [davResults, setDavResults] = useState(null);
+    const [davLiveFrame, setDavLiveFrame] = useState(null);
+    const [occupancyStats, setOccupancyStats] = useState(null); // { total_people, unoccupied_chairs, occupied_chairs, total_chairs, occupancy_rate }
     const videoRef = useRef(null);
+    const davLiveImgRef = useRef(null);
     const streamRef = useRef(null);
     const fileInputRef = useRef(null);
     const detectionIntervalRef = useRef(null);
+    const davAbortControllerRef = useRef(null);
 
     useEffect(() => {
         // Get available cameras on component mount
@@ -119,9 +125,13 @@ function Dashboard() {
         }
     };
 
+    const isDavFile = (file) => file && file.name && file.name.toLowerCase().endsWith('.dav');
+
     const handleFileSelect = (e) => {
         const file = e.target.files[0];
         if (file) {
+            setDavResults(null);
+            setDavLiveFrame(null);
             // Clean up previous file URL if exists
             if (videoFileUrl) {
                 URL.revokeObjectURL(videoFileUrl);
@@ -133,17 +143,29 @@ function Dashboard() {
                 streamRef.current = null;
             }
             
-            const url = URL.createObjectURL(file);
             setSelectedVideoFile(file);
-            setVideoFileUrl(url);
             setVideoMode('file');
+            
+            if (isDavFile(file)) {
+                // .dav files cannot be played in browser; process on server instead
+                setVideoFileUrl(null);
+                if (videoRef.current) {
+                    videoRef.current.srcObject = null;
+                    videoRef.current.removeAttribute('src');
+                    videoRef.current.load();
+                }
+                setIsStreaming(false);
+                return;
+            }
+            
+            const url = URL.createObjectURL(file);
+            setVideoFileUrl(url);
             
             if (videoRef.current) {
                 videoRef.current.srcObject = null;
                 videoRef.current.src = url;
                 videoRef.current.load();
                 
-                // Wait for video to be ready
                 videoRef.current.onloadedmetadata = () => {
                     console.log('Video file metadata loaded');
                     videoRef.current.play().catch(err => {
@@ -157,10 +179,112 @@ function Dashboard() {
             }
             
             setIsStreaming(true);
-            // Start detection after video loads (faster)
             setTimeout(() => {
                 startDetection();
             }, 500);
+        }
+    };
+
+    const handleProcessDavFile = async () => {
+        if (!selectedVideoFile || !isDavFile(selectedVideoFile)) return;
+        setDavProcessing(true);
+        setDavResults(null);
+        setDavLiveFrame(null);
+                        setOccupancyStats(null);
+        setDetectionError(null);
+        try {
+            const formData = new FormData();
+            formData.append('video', selectedVideoFile);
+            formData.append('frame_interval', '5');
+            formData.append('max_frames', '2000');
+            formData.append('conf_threshold', '0.15');
+            const controller = new AbortController();
+            davAbortControllerRef.current = controller;
+            const response = await fetch('http://localhost:5000/api/detect-video-file-stream', {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal,
+            });
+            if (!response.ok || !response.body) {
+                setDetectionError('Streaming failed');
+                return;
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let lastSummary = null;
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const data = JSON.parse(line);
+                        if (data.error) {
+                            setDetectionError(data.error);
+                            continue;
+                        }
+                        if (data.frame !== undefined) {
+                            setDavLiveFrame(data.frame);
+                            const dets = data.detections || [];
+                            const confs = dets.map(d => d.confidence);
+                            const stats = confs.length ? {
+                                count: data.count,
+                                avg_confidence: confs.reduce((a, b) => a + b, 0) / confs.length,
+                                max_confidence: Math.max(...confs),
+                                min_confidence: Math.min(...confs),
+                            } : null;
+                            setDetectionData({
+                                count: data.count,
+                                detections: dets,
+                                stats,
+                            });
+                            if (data.total_people != null || data.occupancy_rate != null) setOccupancyStats({
+                                total_people: data.total_people ?? data.count ?? 0,
+                                unoccupied_chairs: data.unoccupied_chairs ?? data.chair_count ?? 0,
+                                occupied_chairs: data.occupied_chairs ?? data.count ?? 0,
+                                total_chairs: data.total_chairs ?? 0,
+                                occupancy_rate: data.occupancy_rate ?? null,
+                            });
+                        }
+                        if (data.done) {
+                            lastSummary = data;
+                            if (data.success && data.summary) {
+                                setDavResults({
+                                    success: true,
+                                    frames_processed: data.frames_processed,
+                                    summary: data.summary,
+                                    total_frames_in_video: data.total_frames_in_video,
+                                });
+                                setDetectionData({
+                                    count: data.summary.max_count,
+                                    detections: [],
+                                    stats: null,
+                                });
+                            }
+                        }
+                    } catch (_) { /* skip malformed line */ }
+                }
+            }
+        } catch (err) {
+            if (err.name === 'AbortError') {
+                console.log('DAV processing stopped by user');
+                return;
+            }
+            setDetectionError(err.message || 'Failed to process DAV file');
+            console.error(err);
+        } finally {
+            davAbortControllerRef.current = null;
+            setDavProcessing(false);
+        }
+    };
+
+    const handleStopDavProcessing = () => {
+        if (davAbortControllerRef.current) {
+            davAbortControllerRef.current.abort();
         }
     };
 
@@ -284,10 +408,15 @@ function Dashboard() {
         handleStop();
         
         // Clear file selection if switching to camera
-        if (mode === 'camera' && videoFileUrl) {
-            URL.revokeObjectURL(videoFileUrl);
-            setVideoFileUrl(null);
+        if (mode === 'camera') {
+            if (videoFileUrl) {
+                URL.revokeObjectURL(videoFileUrl);
+                setVideoFileUrl(null);
+            }
             setSelectedVideoFile(null);
+            setDavResults(null);
+            setDavLiveFrame(null);
+            setOccupancyStats(null);
             if (fileInputRef.current) {
                 fileInputRef.current.value = '';
             }
@@ -364,7 +493,7 @@ function Dashboard() {
         try {
             const requestBody = {
                 frame: frameBase64,
-                conf_threshold: 0.25  // Lower threshold for better detection in blurred videos
+                conf_threshold: 0.25
             };
             
             console.log('Sending detection request to API...');
@@ -389,6 +518,13 @@ function Dashboard() {
                         count: data.count || 0,
                         detections: data.detections || [],
                         stats: data.stats || null
+                    });
+                    if (data.total_people != null || data.occupancy_rate != null) setOccupancyStats({
+                        total_people: data.total_people ?? data.count ?? 0,
+                        unoccupied_chairs: data.unoccupied_chairs ?? data.chair_count ?? 0,
+                        occupied_chairs: data.occupied_chairs ?? data.count ?? 0,
+                        total_chairs: data.total_chairs ?? 0,
+                        occupancy_rate: data.occupancy_rate ?? null,
                     });
                     setDetectionError(null);
                     setBackendConnected(true);
@@ -584,7 +720,7 @@ function Dashboard() {
                                     ref={fileInputRef}
                                     type="file"
                                     id="videoFileInput"
-                                    accept="video/*"
+                                    accept="video/*,.dav"
                                     onChange={handleFileSelect}
                                     style={{ display: 'none' }}
                                 />
@@ -594,6 +730,28 @@ function Dashboard() {
                                 >
                                     {selectedVideoFile ? selectedVideoFile.name : 'Choose File'}
                                 </button>
+                                {selectedVideoFile && isDavFile(selectedVideoFile) && (
+                                    <>
+                                        <button
+                                            className="control-btn start-btn"
+                                            onClick={handleProcessDavFile}
+                                            disabled={davProcessing || !backendConnected}
+                                            style={{ marginLeft: '8px' }}
+                                        >
+                                            {davProcessing ? 'Processing…' : 'Process on server'}
+                                        </button>
+                                        {davProcessing && (
+                                            <button
+                                                type="button"
+                                                className="control-btn stop-btn"
+                                                onClick={handleStopDavProcessing}
+                                                style={{ marginLeft: '8px' }}
+                                            >
+                                                Stop processing
+                                            </button>
+                                        )}
+                                    </>
+                                )}
                             </div>
                         )}
                         
@@ -601,7 +759,7 @@ function Dashboard() {
                             <button 
                                 className="control-btn start-btn" 
                                 onClick={handleStart}
-                                disabled={isStreaming || (videoMode === 'file' && !selectedVideoFile)}
+                                disabled={isStreaming || (videoMode === 'file' && !selectedVideoFile) || (videoMode === 'file' && selectedVideoFile && isDavFile(selectedVideoFile))}
                             >
                                 Start
                             </button>
@@ -623,7 +781,7 @@ function Dashboard() {
                     </div>
 
                     <div className="video-feed-container">
-                        <div className={`video-feed ${!isStreaming ? 'video-feed-disconnected' : ''}`}>
+                        <div className={`video-feed ${!isStreaming && !davResults?.sample_frames?.length ? 'video-feed-disconnected' : ''}`}>
                             <video
                                 ref={videoRef}
                                 autoPlay
@@ -637,17 +795,49 @@ function Dashboard() {
                                     alert('Error loading video. Please try again.');
                                 }}
                             />
-                            {!isStreaming && (
+                            {davLiveFrame && !isStreaming && (
+                                <div className="dav-live-container" style={{ width: '100%', height: '100%', position: 'absolute', inset: 0, background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                    <img
+                                        ref={davLiveImgRef}
+                                        src={`data:image/jpeg;base64,${davLiveFrame}`}
+                                        alt="Live DAV processing"
+                                        style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+                                    />
+                                    {davProcessing && (
+                                        <div style={{ position: 'absolute', top: '8px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', color: '#fff', padding: '6px 12px', borderRadius: '6px', fontSize: '12px' }}>
+                                            Processing… (live)
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                            {davResults?.sample_frames?.length > 0 && !isStreaming && !davLiveFrame && (
+                                <div className="dav-preview-container" style={{ display: 'block', width: '100%', maxHeight: '100%', overflow: 'auto' }}>
+                                    <p className="video-status" style={{ marginBottom: '8px', fontSize: '12px' }}>DAV file preview (sample frames from detection)</p>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', alignItems: 'flex-start' }}>
+                                        {davResults.sample_frames.map((base64, i) => (
+                                            <img
+                                                key={i}
+                                                src={`data:image/jpeg;base64,${base64}`}
+                                                alt={`Frame ${i + 1}`}
+                                                style={{ maxWidth: '100%', maxHeight: '360px', objectFit: 'contain', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.2)' }}
+                                            />
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {!isStreaming && !davLiveFrame && !davResults?.sample_frames?.length && (
                                 <div className="video-placeholder">
                                     <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                         <path d="M23 7l-7 5 7 5V7z" />
                                         <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
                                     </svg>
-                                    <p>{videoMode === 'camera' ? 'Camera: Disconnected' : 'No Video File Selected'}</p>
+                                    <p>{videoMode === 'camera' ? 'Camera: Disconnected' : (selectedVideoFile && isDavFile(selectedVideoFile) ? 'DAV file selected' : 'No Video File Selected')}</p>
                                     <p className="video-instruction">
                                         {videoMode === 'camera' 
                                             ? 'Camera Not Started. Select camera and click Start. Snapshot feature available.'
-                                            : 'No video file selected. Click "Choose File" to select a video file from your system.'
+                                            : (selectedVideoFile && isDavFile(selectedVideoFile))
+                                                ? 'DAV (Dahua) files are processed on the server. Click "Process on server" to see live video with detection (like MP4).'
+                                                : 'No video file selected. Click "Choose File" to select a video file (MP4, AVI, or .dav).'
                                         }
                                     </p>
                                 </div>
@@ -658,7 +848,7 @@ function Dashboard() {
                                     <p className="video-status">
                                         {videoMode === 'camera' 
                                             ? `Camera: ${selectedCamera === 'Select Camera' ? 'Default Camera' : selectedCamera}`
-                                            : `File: ${selectedVideoFile?.name || 'Video File'}`
+                                            : `File: ${selectedVideoFile?.name || 'Video File'}${selectedVideoFile && isDavFile(selectedVideoFile) ? ' (DAV — use Process on server)' : ''}`
                                         }
                                     </p>
                                 </div>
@@ -674,20 +864,44 @@ function Dashboard() {
                     </div>
                     <div className="panel-content">
                         <div className="detection-section">
-                            <div className="detection-card">
-                                <div className="detection-icon">
-                                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                                        <circle cx="9" cy="7" r="4"></circle>
-                                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                                    </svg>
+                            {occupancyStats ? (
+                                <div className="occupancy-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '14px' }}>Occupancy</div>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total people</span>
+                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_people}</span>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total unoccupied chairs</span>
+                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.unoccupied_chairs}</span>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total occupied chairs</span>
+                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.occupied_chairs}</span>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total chairs</span>
+                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_chairs}</span>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 0 4px' }}>
+                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Occupancy rate</span>
+                                            <span style={{ fontSize: '16px', fontWeight: '700', color: 'var(--accent-color, #4ade80)' }}>
+                                                {occupancyStats.occupancy_rate != null ? `${Number(occupancyStats.occupancy_rate).toFixed(1)}%` : '—'}
+                                            </span>
+                                        </div>
+                                    </div>
                                 </div>
-                                <div className="detection-count">
-                                    <div className="count-number">{detectionData.count}</div>
-                                    <div className="count-label">People Detected</div>
+                            ) : null}
+
+                            {davResults && davResults.success && (
+                                <div className="detection-status" style={{ marginTop: '12px', padding: '12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
+                                    <div className="count-label">DAV file results</div>
+                                    <p style={{ margin: '4px 0', fontSize: '13px' }}>Frames processed: {davResults.frames_processed}</p>
+                                    <p style={{ margin: '4px 0', fontSize: '13px' }}>Max people in frame: {davResults.summary?.max_count ?? 0}</p>
+                                    <p style={{ margin: '4px 0', fontSize: '13px' }}>Frames with people: {davResults.summary?.frames_with_people ?? 0}</p>
                                 </div>
-                            </div>
+                            )}
 
                             {!backendConnected && (
                                 <div className="detection-status">
@@ -745,26 +959,9 @@ function Dashboard() {
                                 </div>
                             )}
 
-                            {detectionData.stats && detectionData.count > 0 && (
-                                <div className="detection-stats">
-                                    <div className="stat-item">
-                                        <span className="stat-label">Avg Confidence:</span>
-                                        <span className="stat-value">{(detectionData.stats.avg_confidence * 100).toFixed(1)}%</span>
-                                    </div>
-                                    <div className="stat-item">
-                                        <span className="stat-label">Max Confidence:</span>
-                                        <span className="stat-value">{(detectionData.stats.max_confidence * 100).toFixed(1)}%</span>
-                                    </div>
-                                    <div className="stat-item">
-                                        <span className="stat-label">Min Confidence:</span>
-                                        <span className="stat-value">{(detectionData.stats.min_confidence * 100).toFixed(1)}%</span>
-                                    </div>
-                                </div>
-                            )}
-
-                            {!isStreaming && (
+                            {!isStreaming && !davResults && (
                                 <div className="detection-message">
-                                    <p>Start video feed to begin people detection</p>
+                                    <p>Start video feed or process a DAV file to begin people detection</p>
                                 </div>
                             )}
 

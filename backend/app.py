@@ -1,10 +1,15 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import base64
+import json
 import numpy as np
 import cv2
 import os
 import sys
+import tempfile
+import subprocess
+import shutil
+from pathlib import Path
 
 # Try to import PeopleDetector, but allow server to start even if it fails
 try:
@@ -112,25 +117,41 @@ def detect_people():
         conf_threshold = data.get('conf_threshold', 0.25)
         print(f"[API] Using confidence threshold: {conf_threshold}")
         
-        # Detect people
-        print("[API] Processing frame with detector...")
-        detections = detector.process_frame_bytes(frame_bytes, conf_threshold)
-        print(f"[API] Detections found: {len(detections)}")
-        
-        if detections:
-            print(f"[API] First detection: {detections[0]}")
-        
-        # Get statistics
+        # Decode frame for detection and occupancy
+        nparr = np.frombuffer(frame_bytes, np.uint8)
+        frame_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame_img is None:
+            return jsonify({'success': False, 'error': 'Could not decode image'}), 400
+
+        # Detect people and chairs (chairs for occupancy by seats)
+        print("[API] Processing frame with detector (people + chairs)...")
+        people, chairs = detector.detect_people_and_chairs(frame_img, conf_threshold)
+        detections = people
+        print(f"[API] People: {len(people)}, Chairs: {len(chairs)}")
+
         stats = detector.get_detection_stats(detections)
-        
+        # Occupied = people (sitting); unoccupied = chairs detected (empty); total = unoccupied + occupied
+        occupied_chairs = len(people)
+        unoccupied_chairs = len(chairs)
+        total_chairs = unoccupied_chairs + occupied_chairs
+        occupancy_rate = round(100.0 * len(people) / total_chairs, 2) if total_chairs > 0 else None
+        if occupancy_rate is not None:
+            occupancy_rate = min(100.0, occupancy_rate)
+
         response_data = {
             'success': True,
             'detections': detections,
             'stats': stats,
-            'count': len(detections)
+            'count': len(detections),
+            'chair_count': len(chairs),
+            'chairs': chairs,
+            'total_people': len(people),
+            'unoccupied_chairs': unoccupied_chairs,
+            'occupied_chairs': occupied_chairs,
+            'total_chairs': total_chairs,
+            'occupancy_rate': occupancy_rate,
         }
-        print(f"[API] Returning response: count={len(detections)}")
-        
+        print(f"[API] people={len(detections)} unocc={unoccupied_chairs} occ={occupied_chairs} total_chairs={total_chairs} occupancy={occupancy_rate}%")
         return jsonify(response_data)
     
     except Exception as e:
@@ -216,6 +237,340 @@ def detect_with_annotations():
         return jsonify({
             'error': str(e)
         }), 500
+
+
+def _dav_to_mp4_temp(dav_path: str) -> str:
+    """
+    Convert a .dav (Dahua) file to a temporary .mp4 using FFmpeg so OpenCV can read it.
+    Returns path to the temp .mp4 file. Caller must delete it when done.
+    """
+    ffmpeg_cmd = shutil.which('ffmpeg')
+    if not ffmpeg_cmd:
+        raise RuntimeError(
+            'FFmpeg is required to process .dav files. '
+            'Install FFmpeg and add it to your PATH (https://ffmpeg.org/download.html).'
+        )
+    fd, out_path = tempfile.mkstemp(suffix='.mp4')
+    os.close(fd)
+    try:
+        # -y overwrite; -c copy for speed (no re-encode). Fallback to recode if copy fails.
+        result = subprocess.run(
+            [ffmpeg_cmd, '-y', '-i', dav_path, '-c', 'copy', out_path],
+            capture_output=True,
+            timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+        )
+        if result.returncode != 0:
+            # Try with re-encode for compatibility
+            result = subprocess.run(
+                [ffmpeg_cmd, '-y', '-i', dav_path, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', out_path],
+                capture_output=True,
+                timeout=600,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+            )
+        if result.returncode != 0:
+            stderr = (result.stderr or b'').decode('utf-8', errors='replace')[:500]
+            raise RuntimeError(f'FFmpeg failed to convert .dav file: {stderr}')
+        return out_path
+    except Exception:
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        raise
+
+
+def _video_path_for_opencv(file_path: str) -> tuple:
+    """
+    Return (path_to_open, temp_path_or_none).
+    If file_path is .dav or OpenCV cannot open it, convert with FFmpeg and return temp path.
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+    cap = cv2.VideoCapture(file_path)
+    if cap.isOpened():
+        cap.release()
+        return file_path, None
+    cap.release()
+    if ext == '.dav':
+        temp_mp4 = _dav_to_mp4_temp(file_path)
+        return temp_mp4, temp_mp4
+    raise RuntimeError(
+        'Could not open video file (unsupported format or corrupted). '
+        'Supported: common formats (e.g. MP4, AVI). For .dav (Dahua) files, install FFmpeg and add it to PATH.'
+    )
+
+
+@app.route('/api/detect-video-file', methods=['POST'])
+def detect_video_file():
+    """
+    Run person detection on an uploaded video file (supports .dav and other formats).
+    Uses FFmpeg to convert .dav (Dahua) to a temporary format OpenCV can read.
+
+    Request: multipart/form-data with field "video" (file).
+    Optional form fields: frame_interval (int, default 10), max_frames (int, default 500), conf_threshold (float, default 0.25).
+
+    Returns: JSON with per-frame counts and summary.
+    """
+    if detector is None:
+        return jsonify({'success': False, 'error': 'Detector not initialized'}), 500
+
+    if 'video' not in request.files:
+        return jsonify({'success': False, 'error': 'No video file provided'}), 400
+
+    file = request.files['video']
+    if not file or file.filename == '':
+        return jsonify({'success': False, 'error': 'No video file selected'}), 400
+
+    frame_interval = request.form.get('frame_interval', type=int) or 10
+    max_frames = request.form.get('max_frames', type=int) or 500
+    conf_threshold = request.form.get('conf_threshold', type=float) or 0.25
+
+    frame_interval = max(1, min(frame_interval, 100))
+    max_frames = max(1, min(max_frames, 2000))
+
+    video_path_to_use = None
+    paths_to_clean = []
+
+    try:
+        fd, save_path = tempfile.mkstemp(suffix=Path(file.filename).suffix or '.bin')
+        os.close(fd)
+        file.save(save_path)
+        paths_to_clean.append(save_path)
+
+        try:
+            video_path_to_use, converted_path = _video_path_for_opencv(save_path)
+            if converted_path:
+                paths_to_clean.append(converted_path)
+        except Exception as e:
+            for p in paths_to_clean:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            return jsonify({'success': False, 'error': str(e)}), 400
+
+        cap = cv2.VideoCapture(video_path_to_use)
+        if not cap.isOpened():
+            return jsonify({
+                'success': False,
+                'error': 'Could not open video. For .dav files ensure FFmpeg is installed.'
+            }), 400
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames_in_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_results = []
+        frames_processed = 0
+        frame_index = 0
+        sample_frames_b64 = []  # annotated frames to show on frontend (max 3)
+        max_count_so_far = -1
+        best_frame_b64 = None
+
+        while frames_processed < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_index % frame_interval != 0:
+                frame_index += 1
+                continue
+            time_sec = frame_index / fps if fps > 0 else 0
+            detections = detector.detect_people(frame, conf_threshold)
+            count = len(detections)
+            annotated = detector.draw_detections(frame.copy(), detections)
+            _, buf = cv2.imencode('.jpg', annotated)
+            frame_b64 = base64.b64encode(buf).decode('utf-8')
+
+            # First frame: always include so user sees video content
+            if frames_processed == 0 and len(sample_frames_b64) < 3:
+                sample_frames_b64.append(frame_b64)
+            # Keep one frame with most people for display
+            if count > max_count_so_far:
+                max_count_so_far = count
+                best_frame_b64 = frame_b64
+
+            frame_results.append({
+                'frame_index': frame_index,
+                'time_sec': round(time_sec, 2),
+                'count': count,
+                'detections': detections,
+            })
+            frames_processed += 1
+            frame_index += 1
+
+        cap.release()
+
+        if best_frame_b64 and (len(sample_frames_b64) == 0 or best_frame_b64 != sample_frames_b64[0]) and len(sample_frames_b64) < 3:
+            sample_frames_b64.append(best_frame_b64)
+        # If we only have one sample, ensure we have at least the first
+        if not sample_frames_b64 and frame_results:
+            pass  # already added first above
+
+        frames_with_people = sum(1 for r in frame_results if r['count'] > 0)
+        max_count = max((r['count'] for r in frame_results), default=0)
+        avg_count = (sum(r['count'] for r in frame_results) / len(frame_results)) if frame_results else 0
+
+        return jsonify({
+            'success': True,
+            'total_frames_in_video': total_frames_in_video,
+            'frames_processed': len(frame_results),
+            'frame_interval': frame_interval,
+            'results': frame_results,
+            'summary': {
+                'max_count': max_count,
+                'avg_count': round(avg_count, 2),
+                'frames_with_people': frames_with_people,
+            },
+            'sample_frames': sample_frames_b64[:3],
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        for p in paths_to_clean:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+def _stream_dav_frames():
+    """
+    Generator used by detect_video_file_stream. Yields NDJSON lines: one per frame, then a final 'done' line.
+    """
+    if detector is None:
+        yield json.dumps({'error': 'Detector not initialized'}) + '\n'
+        yield json.dumps({'done': True, 'success': False}) + '\n'
+        return
+    if 'video' not in request.files:
+        yield json.dumps({'error': 'No video file provided'}) + '\n'
+        yield json.dumps({'done': True, 'success': False}) + '\n'
+        return
+    file = request.files['video']
+    if not file or file.filename == '':
+        yield json.dumps({'error': 'No video file selected'}) + '\n'
+        yield json.dumps({'done': True, 'success': False}) + '\n'
+        return
+
+    frame_interval = request.form.get('frame_interval', type=int) or 5
+    max_frames = request.form.get('max_frames', type=int) or 2000
+    conf_threshold = request.form.get('conf_threshold', type=float) or 0.15
+    frame_interval = max(1, min(frame_interval, 30))
+    max_frames = max(1, min(max_frames, 5000))
+
+    paths_to_clean = []
+    save_path = None
+    try:
+        fd, save_path = tempfile.mkstemp(suffix=Path(file.filename).suffix or '.bin')
+        os.close(fd)
+        file.save(save_path)
+        paths_to_clean.append(save_path)
+
+        try:
+            video_path_to_use, converted_path = _video_path_for_opencv(save_path)
+            if converted_path:
+                paths_to_clean.append(converted_path)
+        except Exception as e:
+            yield json.dumps({'error': str(e)}) + '\n'
+            yield json.dumps({'done': True, 'success': False}) + '\n'
+            return
+
+        cap = cv2.VideoCapture(video_path_to_use)
+        if not cap.isOpened():
+            yield json.dumps({'error': 'Could not open video. For .dav ensure FFmpeg is installed.'}) + '\n'
+            yield json.dumps({'done': True, 'success': False}) + '\n'
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames_in_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_index = 0
+        frames_processed = 0
+        frame_results = []
+
+        while frames_processed < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_index % frame_interval != 0:
+                frame_index += 1
+                continue
+            time_sec = frame_index / fps if fps > 0 else 0
+            people, chairs = detector.detect_people_and_chairs(frame, conf_threshold)
+            count = len(people)
+            annotated = detector.draw_detections_people_and_chairs(frame.copy(), people, chairs)
+            _, buf = cv2.imencode('.jpg', annotated)
+            frame_b64 = base64.b64encode(buf).decode('utf-8')
+            occupied_chairs = count
+            unoccupied_chairs = len(chairs)
+            total_chairs = unoccupied_chairs + occupied_chairs
+            occupancy_rate = round(100.0 * count / total_chairs, 2) if total_chairs > 0 else None
+            if occupancy_rate is not None:
+                occupancy_rate = min(100.0, occupancy_rate)
+            frame_results.append({'frame_index': frame_index, 'time_sec': round(time_sec, 2), 'count': count})
+            payload = {
+                'frame': frame_b64,
+                'frame_index': frame_index,
+                'time_sec': round(time_sec, 2),
+                'count': count,
+                'detections': people,
+                'chair_count': len(chairs),
+                'chairs': chairs,
+                'total_people': count,
+                'unoccupied_chairs': unoccupied_chairs,
+                'occupied_chairs': occupied_chairs,
+                'total_chairs': total_chairs,
+                'occupancy_rate': occupancy_rate,
+            }
+            yield json.dumps(payload) + '\n'
+            frames_processed += 1
+            frame_index += 1
+
+        cap.release()
+        frames_with_people = sum(1 for r in frame_results if r['count'] > 0)
+        max_count = max((r['count'] for r in frame_results), default=0)
+        avg_count = (sum(r['count'] for r in frame_results) / len(frame_results)) if frame_results else 0
+        summary = {
+            'max_count': max_count,
+            'avg_count': round(avg_count, 2),
+            'frames_with_people': frames_with_people,
+        }
+        yield json.dumps({
+            'done': True,
+            'success': True,
+            'total_frames_in_video': total_frames_in_video,
+            'frames_processed': len(frame_results),
+            'frame_interval': frame_interval,
+            'summary': summary,
+        }) + '\n'
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        yield json.dumps({'error': str(e)}) + '\n'
+        yield json.dumps({'done': True, 'success': False}) + '\n'
+    finally:
+        for p in paths_to_clean:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+@app.route('/api/detect-video-file-stream', methods=['POST'])
+def detect_video_file_stream():
+    """
+    Stream person detection on an uploaded video file (.dav or other). Each frame is sent to the client
+    as it is processed so the frontend can show live video with detection (like MP4 playback).
+    """
+    return Response(
+        stream_with_context(_stream_dav_frames()),
+        mimetype='application/x-ndjson',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
 
 if __name__ == '__main__':
     print("Initializing CCTV Hackathon Backend...")

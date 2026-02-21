@@ -116,60 +116,135 @@ class PeopleDetector:
             
             return denoised
     
-    def detect_people(self, frame: np.ndarray, conf_threshold: float = 0.25, iou_threshold: float = 0.45) -> List[Dict]:
+    # COCO class ids: 0 = person, 56 = chair
+    COCO_CHAIR_CLASS_ID = 56
+
+    def _run_inference(self, frame: np.ndarray, conf: float, imgsz: int, classes: List[int] = None) -> List[Dict]:
+        """Run YOLO and return list of detection dicts (bbox, confidence, class). classes defaults to [0] (person)."""
+        if classes is None:
+            classes = [0]
+        class_names = {0: 'person', 56: 'chair'}
+        results = self.model(
+            frame,
+            imgsz=imgsz,
+            classes=classes,
+            conf=conf,
+            iou=0.45,
+            max_det=100,
+            verbose=False,
+            agnostic_nms=False,
+        )
+        out = []
+        for result in results:
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            for box in result.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cid = int(box.cls[0].cpu().numpy())
+                out.append({
+                    'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                    'confidence': float(box.conf[0].cpu().numpy()),
+                    'class': class_names.get(cid, 'object'),
+                    'class_id': cid,
+                })
+        return out
+
+    def _nms_merge(self, detections: List[Dict], iou_threshold: float = 0.5) -> List[Dict]:
+        """Merge overlapping detections via NMS (keep highest confidence per overlap)."""
+        if len(detections) <= 1:
+            return detections
+        boxes_xyxy = np.array([d['bbox'] for d in detections], dtype=np.float32)
+        scores = np.array([d['confidence'] for d in detections], dtype=np.float32)
+        # NMSBoxes expects list of (x, y, w, h)
+        x, y = boxes_xyxy[:, 0], boxes_xyxy[:, 1]
+        w = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
+        h = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]
+        boxes_xywh = np.column_stack((x, y, w, h)).tolist()
+        indices = cv2.dnn.NMSBoxes(
+            boxes_xywh,
+            scores.tolist(),
+            score_threshold=0.0,
+            nms_threshold=iou_threshold,
+        )
+        if len(indices) == 0:
+            indices = np.arange(len(detections))
+        if hasattr(indices, 'flatten'):
+            indices = indices.flatten()
+        return [detections[int(i)] for i in indices]
+
+    def detect_people(self, frame: np.ndarray, conf_threshold: float = 0.2, iou_threshold: float = 0.45) -> List[Dict]:
         """
-        Detect people in a video frame with enhanced accuracy
+        Detect people in a video frame, including sitting/static and small (distant) persons.
+        Runs on both enhanced and original frame and merges results for more consistent detection.
         
         Args:
             frame: Input frame as numpy array (BGR format)
-            conf_threshold: Confidence threshold for detections (default: 0.25 for better recall)
+            conf_threshold: Confidence threshold (default 0.2 for better recall on static/small people)
             iou_threshold: IoU threshold for NMS (default: 0.45)
         
         Returns:
             List of detection dictionaries with bbox, confidence, and class
         """
-        # Enhance image quality for better detection (fast mode for real-time)
         enhanced_frame = self.enhance_image(frame, fast_mode=True)
-        
-        # Run inference with optimized parameters for blurred videos
-        # Using lower confidence, higher IOU, and max_det for better recall
-        print(f"[Detector] Running YOLO inference on frame shape {frame.shape} with threshold {conf_threshold}")
-        results = self.model(
-            enhanced_frame, 
-            classes=[0],  # Only detect 'person' class
-            conf=conf_threshold,
-            iou=iou_threshold,
-            max_det=100,  # Allow more detections
-            verbose=False,
-            agnostic_nms=False  # Class-aware NMS
-        )
-        
-        detections = []
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None and len(boxes) > 0:
-                print(f"[Detector] Found {len(boxes)} bounding boxes")
-                for i, box in enumerate(boxes):
-                    # Get bounding box coordinates
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    confidence = float(box.conf[0].cpu().numpy())
-                    class_id = int(box.cls[0].cpu().numpy())
-                    
-                    print(f"[Detector] Detection {i+1}: conf={confidence:.3f}, bbox=[{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
-                    
-                    detections.append({
-                        'bbox': [float(x1), float(y1), float(x2), float(y2)],
-                        'confidence': confidence,
-                        'class': 'person',
-                        'class_id': class_id
-                    })
-            else:
-                print(f"[Detector] No boxes found in result")
-        
-        print(f"[Detector] Total detections: {len(detections)}")
-        return detections
-    
-    def process_frame_bytes(self, frame_bytes: bytes, conf_threshold: float = 0.25) -> List[Dict]:
+        imgsz = 1280 if max(frame.shape[:2]) >= 720 else 640
+        conf_lo = max(0.1, conf_threshold * 0.75)
+
+        # Pass 1: enhanced frame at main threshold (better for motion/blur)
+        dets_enhanced = self._run_inference(enhanced_frame, conf_threshold, imgsz)
+        # Pass 2: original frame at lower threshold (catches static/sitting when enhancement drops confidence)
+        dets_original = self._run_inference(frame, conf_lo, imgsz)
+        merged = self._nms_merge(dets_enhanced + dets_original, iou_threshold=iou_threshold)
+
+        print(f"[Detector] Frame {frame.shape} imgsz={imgsz} conf={conf_threshold} -> enhanced={len(dets_enhanced)} original={len(dets_original)} -> merged={len(merged)}")
+        for i, d in enumerate(merged):
+            print(f"[Detector] Detection {i+1}: conf={d['confidence']:.3f}, bbox={d['bbox']}")
+        return merged
+
+    def detect_chairs(self, frame: np.ndarray, conf_threshold: float = 0.15) -> List[Dict]:
+        """
+        Detect chairs in the frame (COCO class 56), including occluded chairs (with people sitting).
+        Uses dual-pass (enhanced + original at lower conf) and NMS merge for better recall.
+        """
+        enhanced_frame = self.enhance_image(frame, fast_mode=True)
+        imgsz = 1280 if max(frame.shape[:2]) >= 720 else 640
+        conf_lo = max(0.08, conf_threshold * 0.6)
+        chairs_enhanced = self._run_inference(enhanced_frame, conf_threshold, imgsz, classes=[self.COCO_CHAIR_CLASS_ID])
+        chairs_original = self._run_inference(frame, conf_lo, imgsz, classes=[self.COCO_CHAIR_CLASS_ID])
+        merged = self._nms_merge(chairs_enhanced + chairs_original, iou_threshold=0.5)
+        print(f"[Detector] Chairs: enhanced={len(chairs_enhanced)} original={len(chairs_original)} -> merged={len(merged)}")
+        return merged
+
+    def detect_people_and_chairs(self, frame: np.ndarray, conf_threshold: float = 0.2, iou_threshold: float = 0.45) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Detect both people and chairs. Returns (people_detections, chair_detections).
+        Use for occupancy by chairs: occupancy = (len(people) / len(chairs)) * 100.
+        """
+        people = self.detect_people(frame, conf_threshold, iou_threshold)
+        chairs = self.detect_chairs(frame, conf_threshold)
+        return people, chairs
+
+    def draw_detections_people_and_chairs(self, frame: np.ndarray, people: List[Dict], chairs: List[Dict]) -> np.ndarray:
+        """Draw people in green, chairs in yellow (BGR)."""
+        annotated = frame.copy()
+        for det in people:
+            x1, y1, x2, y2 = det['bbox']
+            conf = det['confidence']
+            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            label = f"Person {conf:.2f}"
+            sz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(annotated, (int(x1), int(y1) - sz[1] - 10), (int(x1) + sz[0], int(y1)), (0, 255, 0), -1)
+            cv2.putText(annotated, label, (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        for det in chairs:
+            x1, y1, x2, y2 = det['bbox']
+            conf = det['confidence']
+            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+            label = f"Chair {conf:.2f}"
+            sz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(annotated, (int(x1), int(y1) - sz[1] - 10), (int(x1) + sz[0], int(y1)), (0, 255, 255), -1)
+            cv2.putText(annotated, label, (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        return annotated
+
+    def process_frame_bytes(self, frame_bytes: bytes, conf_threshold: float = 0.2) -> List[Dict]:
         """
         Process frame from bytes (e.g., from API request)
         
