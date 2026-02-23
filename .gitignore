@@ -1,0 +1,4 @@
+backend_new/data/*
+backend_new/logs/*
+backend_new/outputs/*
+backend_new/*.pt

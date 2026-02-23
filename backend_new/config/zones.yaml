@@ -1,0 +1,26 @@
+cameras:
+  CAM-03:
+    zone_name: "Meeting Room 2"
+    zone_type: "UNRESTRICTED"
+    allowed_days: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    allowed_time: ["00:00","23:59"]
+    allowed_occupancy: 8
+    min_presence_seconds: 0
+    person_conf_threshold: 0.25
+    roi:
+      polygon: []  # empty = full frame
+
+  CAM-09:
+    zone_name: "Restricted Room"
+    zone_type: "RESTRICTED"
+    allowed_days: ["Mon","Tue","Wed","Thu","Fri"]
+    allowed_time: ["09:00","19:00"]
+    allowed_occupancy: 1
+    min_presence_seconds: 3
+    person_conf_threshold: 0.3
+    roi:
+      polygon: []  # set polygon later if camera includes corridor
+
+run_command:
+  cd backend_new
+  python -m src.main --camera-id CAM-03 --source "D:\Himanshu\code\hackathon_dpa\cctv_hackathon\backend_new\data\Security_camera_view_of_people_working_at_office_720P.mp4" --skip-yolo-when-low-motion --min-yolo-interval-seconds 5 --stale-occupancy-ttl-seconds 10 --save-debug --show
