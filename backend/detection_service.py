@@ -49,7 +49,7 @@ except Exception as e:
 
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 class PeopleDetector:
     """YOLOv8-based people detection service with enhanced accuracy for blurred videos"""
@@ -328,4 +328,51 @@ class PeopleDetector:
             'max_confidence': float(np.max(confidences)),
             'min_confidence': float(np.min(confidences))
         }
+
+
+def extract_video_datetime(frame: np.ndarray) -> Optional[str]:
+    """
+    Extract date/time text from the upper-middle to top-right of a video frame (CCTV OSD).
+    Returns a cleaned string or None if OCR is unavailable or no text found.
+    Requires: pip install pytesseract and Tesseract OCR installed on the system.
+    """
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+    if frame is None or frame.size == 0:
+        return None
+    try:
+        h, w = frame.shape[:2]
+        # Upper region: from 25% left to 100% (upper-middle to top-right), top 28% height
+        x1 = int(w * 0.25)
+        y1 = 0
+        x2 = w
+        y2 = int(h * 0.28)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        roi = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # Upscale if small to improve OCR
+        if gray.shape[1] < 280:
+            scale = 280 / max(gray.shape[1], 1)
+            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # Try Otsu threshold (dark text on light)
+        th, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        text1 = pytesseract.image_to_string(binary, config='--psm 6').strip()
+        # Try inverted (white text on dark background - common for CCTV OSD)
+        binary_inv = cv2.bitwise_not(binary)
+        text2 = pytesseract.image_to_string(binary_inv, config='--psm 6').strip()
+        text1 = ' '.join(text1.split())
+        text2 = ' '.join(text2.split())
+        # Prefer result that looks like date/time (digits, slashes, colons, AM/PM)
+        def score(s):
+            if not s or len(s) < 6:
+                return 0
+            digits = sum(c.isdigit() for c in s)
+            return digits + (2 if ('/' in s or ':' in s) else 0) + (1 if ('AM' in s.upper() or 'PM' in s.upper()) else 0)
+        best = max([(score(text1), text1), (score(text2), text2)], key=lambda x: x[0])
+        return best[1] if best[0] > 0 else (text1 or text2 or None)
+    except Exception:
+        return None
 

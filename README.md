@@ -9,6 +9,7 @@ Installation and setup guide for the CCTV Hackathon project (backend + frontend)
 - **Python 3.8+** (for backend)
 - **Node.js 18+** and **npm** (for frontend)
 - **FFmpeg** (optional but required for **.dav** Dahua CCTV files): [Download FFmpeg](https://ffmpeg.org/download.html) and add it to your PATH.
+- **Tesseract OCR** (optional, for **video date/time** from CCTV OSD): [Download Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) and add it to your PATH. If not installed, the app still runs; the “Video date / time” field will show “—”.
 
 ---
 

@@ -17,6 +17,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
+try:
+    from oracle_occupancy import parse_dav_filename, insert_occupancy_buckets
+except ImportError:
+    parse_dav_filename = None
+    insert_occupancy_buckets = None
+
 # Microsoft SSO (OAuth 2.0) config from env
 MICROSOFT_CLIENT_ID = os.environ.get('MICROSOFT_CLIENT_ID', '')
 MICROSOFT_CLIENT_SECRET = os.environ.get('MICROSOFT_CLIENT_SECRET', '')
@@ -27,12 +33,13 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
 
 # Try to import PeopleDetector, but allow server to start even if it fails
 try:
-    from detection_service import PeopleDetector
+    from detection_service import PeopleDetector, extract_video_datetime
     DETECTOR_AVAILABLE = True
 except Exception as e:
     print(f"Warning: Could not import PeopleDetector: {e}")
     print("Server will start but detection features will be disabled.")
     PeopleDetector = None
+    extract_video_datetime = lambda frame: None
     DETECTOR_AVAILABLE = False
 
 app = Flask(__name__)
@@ -238,6 +245,9 @@ def detect_people():
         detections = people
         print(f"[API] People: {len(people)}, Chairs: {len(chairs)}")
 
+        # Extract date/time from top-right corner (CCTV OSD) if available
+        video_datetime = extract_video_datetime(frame_img)
+
         stats = detector.get_detection_stats(detections)
         # Occupied = people (sitting); unoccupied = chairs detected (empty); total = unoccupied + occupied
         occupied_chairs = len(people)
@@ -247,6 +257,7 @@ def detect_people():
         if occupancy_rate is not None:
             occupancy_rate = min(100.0, occupancy_rate)
 
+        h, w = frame_img.shape[:2]
         response_data = {
             'success': True,
             'detections': detections,
@@ -259,6 +270,9 @@ def detect_people():
             'occupied_chairs': occupied_chairs,
             'total_chairs': total_chairs,
             'occupancy_rate': occupancy_rate,
+            'video_datetime': video_datetime,
+            'frame_width': w,
+            'frame_height': h,
         }
         print(f"[API] people={len(detections)} unocc={unoccupied_chairs} occ={occupied_chairs} total_chairs={total_chairs} occupancy={occupancy_rate}%")
         return jsonify(response_data)
@@ -567,8 +581,14 @@ def _stream_dav_frames():
     frame_interval = request.form.get('frame_interval', type=int) or 5
     max_frames = request.form.get('max_frames', type=int) or 2000
     conf_threshold = request.form.get('conf_threshold', type=float) or 0.15
+    draw_chairs = request.form.get('draw_chairs', 'true').lower() != 'false'
+    save_occupancy_to_db = request.form.get('save_occupancy_to_db', 'false').lower() == 'true'
     frame_interval = max(1, min(frame_interval, 30))
     max_frames = max(1, min(max_frames, 5000))
+
+    filename = file.filename or ''
+    parsed_filename = parse_dav_filename(filename) if (save_occupancy_to_db and parse_dav_filename) else None
+    occupancy_buckets = {}  # bucket_index -> {max_people, unoccupied_chairs, occupied_chairs, occupancy_rate}
 
     paths_to_clean = []
     save_path = None
@@ -609,7 +629,10 @@ def _stream_dav_frames():
             time_sec = frame_index / fps if fps > 0 else 0
             people, chairs = detector.detect_people_and_chairs(frame, conf_threshold)
             count = len(people)
-            annotated = detector.draw_detections_people_and_chairs(frame.copy(), people, chairs)
+            if draw_chairs:
+                annotated = detector.draw_detections_people_and_chairs(frame.copy(), people, chairs)
+            else:
+                annotated = detector.draw_detections(frame.copy(), people)
             _, buf = cv2.imencode('.jpg', annotated)
             frame_b64 = base64.b64encode(buf).decode('utf-8')
             occupied_chairs = count
@@ -618,6 +641,18 @@ def _stream_dav_frames():
             occupancy_rate = round(100.0 * count / total_chairs, 2) if total_chairs > 0 else None
             if occupancy_rate is not None:
                 occupancy_rate = min(100.0, occupancy_rate)
+            if parsed_filename:
+                bucket_idx = int(time_sec // 600)
+                prev = occupancy_buckets.get(bucket_idx)
+                if prev is None or count > prev['max_people']:
+                    occupancy_buckets[bucket_idx] = {
+                        'max_people': count,
+                        'unoccupied_chairs': unoccupied_chairs,
+                        'occupied_chairs': occupied_chairs,
+                        'occupancy_rate': occupancy_rate,
+                    }
+            video_datetime = extract_video_datetime(frame)
+            fh, fw = frame.shape[:2]
             frame_results.append({'frame_index': frame_index, 'time_sec': round(time_sec, 2), 'count': count})
             payload = {
                 'frame': frame_b64,
@@ -632,12 +667,28 @@ def _stream_dav_frames():
                 'occupied_chairs': occupied_chairs,
                 'total_chairs': total_chairs,
                 'occupancy_rate': occupancy_rate,
+                'video_datetime': video_datetime,
+                'frame_width': fw,
+                'frame_height': fh,
             }
             yield json.dumps(payload) + '\n'
             frames_processed += 1
             frame_index += 1
 
         cap.release()
+        if parsed_filename and occupancy_buckets and insert_occupancy_buckets:
+            sorted_indices = sorted(occupancy_buckets.keys())
+            bucket_list = [occupancy_buckets[i] for i in sorted_indices]
+            ok, err = insert_occupancy_buckets(
+                camera_number=parsed_filename['camera_number'],
+                occupancy_date=parsed_filename['occupancy_date'],
+                start_hour=parsed_filename['start_hour'],
+                start_min=parsed_filename['start_min'],
+                start_sec=parsed_filename['start_sec'],
+                buckets=bucket_list,
+            )
+            if not ok:
+                print(f"[Oracle] insert failed: {err}")
         frames_with_people = sum(1 for r in frame_results if r['count'] > 0)
         max_count = max((r['count'] for r in frame_results), default=0)
         avg_count = (sum(r['count'] for r in frame_results) / len(frame_results)) if frame_results else 0

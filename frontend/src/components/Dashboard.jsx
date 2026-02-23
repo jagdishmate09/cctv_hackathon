@@ -22,15 +22,98 @@ function Dashboard() {
     const [backendConnected, setBackendConnected] = useState(false);
     const [detectionError, setDetectionError] = useState(null);
     const [davProcessing, setDavProcessing] = useState(false);
+    const [davPaused, setDavPaused] = useState(false);
     const [davResults, setDavResults] = useState(null);
     const [davLiveFrame, setDavLiveFrame] = useState(null);
     const [occupancyStats, setOccupancyStats] = useState(null); // { total_people, unoccupied_chairs, occupied_chairs, total_chairs, occupancy_rate }
+    const [videoDateTime, setVideoDateTime] = useState(null);   // date/time extracted from video (top-right OSD)
+    const [featureTab, setFeatureTab] = useState('occupancy_rate'); // 'occupancy_rate' | 'occupancy_analysis' | 'threat_detection'
+    const [threatBox, setThreatBox] = useState(null);                 // { x1, y1, x2, y2 } normalized 0-1 (red box)
+    const [isDrawingBoundary, setIsDrawingBoundary] = useState(false);
+    const [dragStart, setDragStart] = useState(null);                // { x, y } normalized while drawing
+    const [dragCurrent, setDragCurrent] = useState(null);            // { x, y } normalized while drawing
+    const [threatAlert, setThreatAlert] = useState(false);
+    const [lastFrameDimensions, setLastFrameDimensions] = useState({ w: 0, h: 0 });
     const videoRef = useRef(null);
     const davLiveImgRef = useRef(null);
     const streamRef = useRef(null);
     const fileInputRef = useRef(null);
     const detectionIntervalRef = useRef(null);
     const davAbortControllerRef = useRef(null);
+    const davPausedRef = useRef(false);
+    const videoFeedContainerRef = useRef(null);
+    const boundaryCanvasRef = useRef(null);
+    const boundaryOverlayRef = useRef(null);
+    const threatBoxRef = useRef(null);
+    useEffect(() => { threatBoxRef.current = threatBox; }, [threatBox]);
+
+    const getNormalizedCoords = (e) => {
+        const el = isStreaming ? videoRef.current : (davLiveFrame && davLiveImgRef.current) ? davLiveImgRef.current : null;
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        const w = el.videoWidth ?? el.naturalWidth ?? 1;
+        const h = el.videoHeight ?? el.naturalHeight ?? 1;
+        const scale = Math.min(rect.width / w, rect.height / h);
+        const dw = w * scale;
+        const dh = h * scale;
+        // Video content (letterbox) position in client coordinates – same space as e.clientX/clientY
+        const contentLeft = rect.left + (rect.width - dw) / 2;
+        const contentTop = rect.top + (rect.height - dh) / 2;
+        const nx = (e.clientX - contentLeft) / dw;
+        const ny = (e.clientY - contentTop) / dh;
+        // Clamp so drawing works anywhere on overlay; edges map to video edges
+        return { x: Math.max(0, Math.min(1, nx)), y: Math.max(0, Math.min(1, ny)) };
+    };
+
+    const handleBoundaryMouseDown = (e) => {
+        if (!isDrawingBoundary) return;
+        const pt = getNormalizedCoords(e);
+        if (pt) setDragStart(pt);
+    };
+
+    const handleBoundaryMouseMove = (e) => {
+        if (!isDrawingBoundary || !dragStart) return;
+        const pt = getNormalizedCoords(e);
+        if (pt) setDragCurrent(pt);
+    };
+
+    const handleBoundaryMouseUp = (e) => {
+        if (!isDrawingBoundary || !dragStart) return;
+        const pt = getNormalizedCoords(e) || dragCurrent;
+        if (pt) {
+            const x1 = Math.min(dragStart.x, pt.x);
+            const y1 = Math.min(dragStart.y, pt.y);
+            const x2 = Math.max(dragStart.x, pt.x);
+            const y2 = Math.max(dragStart.y, pt.y);
+            if (x2 - x1 > 0.01 && y2 - y1 > 0.01) setThreatBox({ x1, y1, x2, y2 });
+        }
+        setDragStart(null);
+        setDragCurrent(null);
+        setIsDrawingBoundary(false);
+    };
+
+    const handleBoundaryMouseLeave = () => {
+        if (dragStart) {
+            setDragStart(null);
+            setDragCurrent(null);
+        }
+    };
+
+    const checkThreatInFrame = (detections, frameWidth, frameHeight) => {
+        const box = threatBoxRef.current;
+        if (!box || !detections || !frameWidth || !frameHeight) {
+            setThreatAlert(false);
+            return;
+        }
+        const tx1 = box.x1 * frameWidth, ty1 = box.y1 * frameHeight, tx2 = box.x2 * frameWidth, ty2 = box.y2 * frameHeight;
+        // Alert if any part of the person's bbox overlaps the red box (e.g. head entering counts)
+        const anyOverlap = detections.some((det) => {
+            const bbox = det.bbox || det;
+            const px1 = bbox[0], py1 = bbox[1], px2 = bbox[2], py2 = bbox[3];
+            return px1 < tx2 && px2 > tx1 && py1 < ty2 && py2 > ty1;
+        });
+        setThreatAlert(anyOverlap);
+    };
 
     useEffect(() => {
         const params = new URLSearchParams(window.location.search);
@@ -48,6 +131,51 @@ function Dashboard() {
             return;
         }
     }, [navigate, setSearchParams]);
+
+    useEffect(() => {
+        const overlay = boundaryOverlayRef.current;
+        const canvas = boundaryCanvasRef.current;
+        const el = isStreaming ? videoRef.current : (davLiveFrame && davLiveImgRef.current) ? davLiveImgRef.current : null;
+        if (!overlay || !canvas || !el) return;
+        const ow = overlay.clientWidth;
+        const oh = overlay.clientHeight;
+        if (ow <= 0 || oh <= 0) return;
+        canvas.width = ow;
+        canvas.height = oh;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const rect = el.getBoundingClientRect();
+        const cr = canvas.getBoundingClientRect();
+        const w = el.videoWidth ?? el.naturalWidth ?? 1;
+        const h = el.videoHeight ?? el.naturalHeight ?? 1;
+        const scale = Math.min(rect.width / w, rect.height / h);
+        const dw = w * scale;
+        const dh = h * scale;
+        const contentLeft = rect.left + (rect.width - dw) / 2;
+        const contentTop = rect.top + (rect.height - dh) / 2;
+        const contentLeftCanvas = ((contentLeft - cr.left) / cr.width) * canvas.width;
+        const contentTopCanvas = ((contentTop - cr.top) / cr.height) * canvas.height;
+        const contentWCanvas = (dw / cr.width) * canvas.width;
+        const contentHCanvas = (dh / cr.height) * canvas.height;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        let x1, y1, x2, y2;
+        if (isDrawingBoundary && dragStart && dragCurrent) {
+            x1 = contentLeftCanvas + Math.min(dragStart.x, dragCurrent.x) * contentWCanvas;
+            y1 = contentTopCanvas + Math.min(dragStart.y, dragCurrent.y) * contentHCanvas;
+            x2 = contentLeftCanvas + Math.max(dragStart.x, dragCurrent.x) * contentWCanvas;
+            y2 = contentTopCanvas + Math.max(dragStart.y, dragCurrent.y) * contentHCanvas;
+        } else if (threatBox) {
+            x1 = contentLeftCanvas + threatBox.x1 * contentWCanvas;
+            y1 = contentTopCanvas + threatBox.y1 * contentHCanvas;
+            x2 = contentLeftCanvas + threatBox.x2 * contentWCanvas;
+            y2 = contentTopCanvas + threatBox.y2 * contentHCanvas;
+        } else return;
+        ctx.strokeStyle = '#ef4444';
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.25)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    }, [isDrawingBoundary, dragStart, dragCurrent, threatBox, isStreaming, davLiveFrame]);
 
     useEffect(() => {
         // Get available cameras on component mount
@@ -208,6 +336,8 @@ function Dashboard() {
     const handleProcessDavFile = async () => {
         if (!selectedVideoFile || !isDavFile(selectedVideoFile)) return;
         setDavProcessing(true);
+        setDavPaused(false);
+        davPausedRef.current = false;
         setDavResults(null);
         setDavLiveFrame(null);
                         setOccupancyStats(null);
@@ -218,6 +348,8 @@ function Dashboard() {
             formData.append('frame_interval', '5');
             formData.append('max_frames', '2000');
             formData.append('conf_threshold', '0.15');
+            formData.append('draw_chairs', featureTab === 'threat_detection' ? 'false' : 'true');
+            formData.append('save_occupancy_to_db', featureTab === 'occupancy_rate' ? 'true' : 'false');
             const controller = new AbortController();
             davAbortControllerRef.current = controller;
             const response = await fetch('http://localhost:5000/api/detect-video-file-stream', {
@@ -247,8 +379,11 @@ function Dashboard() {
                             setDetectionError(data.error);
                             continue;
                         }
-                        if (data.frame !== undefined) {
+                        if (data.frame !== undefined && !davPausedRef.current) {
                             setDavLiveFrame(data.frame);
+                            if (data.video_datetime != null) setVideoDateTime(data.video_datetime);
+                            if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
+                            checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
                             const dets = data.detections || [];
                             const confs = dets.map(d => d.confidence);
                             const stats = confs.length ? {
@@ -298,8 +433,15 @@ function Dashboard() {
             console.error(err);
         } finally {
             davAbortControllerRef.current = null;
+            davPausedRef.current = false;
             setDavProcessing(false);
+            setDavPaused(false);
         }
+    };
+
+    const handlePauseResumeDav = () => {
+        davPausedRef.current = !davPausedRef.current;
+        setDavPaused(davPausedRef.current);
     };
 
     const handleStopDavProcessing = () => {
@@ -546,6 +688,9 @@ function Dashboard() {
                         total_chairs: data.total_chairs ?? 0,
                         occupancy_rate: data.occupancy_rate ?? null,
                     });
+                    if (data.video_datetime != null) setVideoDateTime(data.video_datetime);
+                    if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
+                    checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
                     setDetectionError(null);
                     setBackendConnected(true);
                 } else {
@@ -681,13 +826,107 @@ function Dashboard() {
             </div>
 
             <div className="dashboard-content">
-                {/* Left Panel - Parameters (for future use) */}
+                {/* Left Panel - Features */}
                 <div className="left-panel">
                     <div className="panel-header">
-                        <h2>PARAMETERS</h2>
+                        <h2>Features</h2>
                     </div>
                     <div className="panel-content">
-                        <p className="placeholder-text">Parameters will be added here</p>
+                        <div className="feature-tabs">
+                            <button
+                                type="button"
+                                className={`feature-tab ${featureTab === 'occupancy_rate' ? 'active' : ''}`}
+                                onClick={() => setFeatureTab('occupancy_rate')}
+                            >
+                                Occupancy rate
+                            </button>
+                            <button
+                                type="button"
+                                className={`feature-tab ${featureTab === 'occupancy_analysis' ? 'active' : ''}`}
+                                onClick={() => setFeatureTab('occupancy_analysis')}
+                            >
+                                Occupancy Analysis
+                            </button>
+                            <button
+                                type="button"
+                                className={`feature-tab ${featureTab === 'threat_detection' ? 'active' : ''}`}
+                                onClick={() => setFeatureTab('threat_detection')}
+                            >
+                                Threat detection
+                            </button>
+                        </div>
+                        <div className="feature-tab-content">
+                            {featureTab === 'occupancy_rate' && (
+                                <div className="feature-pane">
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>Current occupancy</div>
+                                    {occupancyStats ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+                                                <span style={{ color: 'rgba(255,255,255,0.85)' }}>Occupancy rate</span>
+                                                <span style={{ fontWeight: '600', color: 'var(--accent-color, #4ade80)' }}>
+                                                    {occupancyStats.occupancy_rate != null ? `${Number(occupancyStats.occupancy_rate).toFixed(1)}%` : '—'}
+                                                </span>
+                                            </div>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+                                                <span style={{ color: 'rgba(255,255,255,0.85)' }}>People</span>
+                                                <span style={{ fontWeight: '600' }}>{occupancyStats.total_people}</span>
+                                            </div>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+                                                <span style={{ color: 'rgba(255,255,255,0.85)' }}>Total chairs</span>
+                                                <span style={{ fontWeight: '600' }}>{occupancyStats.total_chairs}</span>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <p className="placeholder-text" style={{ marginTop: '8px' }}>Start video or process a file to see occupancy rate.</p>
+                                    )}
+                                </div>
+                            )}
+                            {featureTab === 'occupancy_analysis' && (
+                                <div className="feature-pane">
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>Occupancy Analysis</div>
+                                    <p className="placeholder-text">Occupancy analysis content will be added here.</p>
+                                </div>
+                            )}
+                            {featureTab === 'threat_detection' && (
+                                <div className="feature-pane">
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>Threat detection</div>
+                                    <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.8)', marginBottom: '12px', lineHeight: 1.5 }}>
+                                        Drag on the video to draw a red box. When a person enters the box, an alert is triggered.
+                                    </p>
+                                    <button
+                                        type="button"
+                                        className="control-btn start-btn"
+                                        style={{ marginBottom: '8px', width: '100%' }}
+                                        onClick={() => { setIsDrawingBoundary(true); setDragStart(null); setDragCurrent(null); }}
+                                    >
+                                        {threatBox ? 'Redraw box' : 'Draw box on video'}
+                                    </button>
+                                    {threatBox && (
+                                        <button
+                                            type="button"
+                                            className="control-btn stop-btn"
+                                            style={{ marginBottom: '12px', width: '100%', justifyContent: 'center' }}
+                                            onClick={() => { setThreatBox(null); setThreatAlert(false); }}
+                                        >
+                                            Clear box
+                                        </button>
+                                    )}
+                                    <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.7)', marginBottom: '8px' }}>
+                                        {threatBox ? 'Red box set on video' : 'No box drawn'}
+                                    </div>
+                                    {isDrawingBoundary && (
+                                        <p style={{ fontSize: '11px', color: 'rgba(255,255,255,0.6)', marginTop: '4px' }}>
+                                            Drag on the video to draw the box, then release.
+                                        </p>
+                                    )}
+                                    {threatAlert && (
+                                        <div className="threat-alert-banner" style={{ padding: '12px', background: 'rgba(239, 68, 68, 0.25)', border: '1px solid rgba(239, 68, 68, 0.6)', borderRadius: '8px', color: '#fca5a5', fontWeight: '600', fontSize: '13px', marginTop: '8px' }}>
+                                            Alert: Person in unrestricted area
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </div>
 
@@ -746,57 +985,81 @@ function Dashboard() {
                                     {selectedVideoFile ? selectedVideoFile.name : 'Choose File'}
                                 </button>
                                 {selectedVideoFile && isDavFile(selectedVideoFile) && (
-                                    <>
-                                        <button
-                                            className="control-btn start-btn"
-                                            onClick={handleProcessDavFile}
-                                            disabled={davProcessing || !backendConnected}
-                                            style={{ marginLeft: '8px' }}
-                                        >
-                                            {davProcessing ? 'Processing…' : 'Process on server'}
-                                        </button>
-                                        {davProcessing && (
-                                            <button
-                                                type="button"
-                                                className="control-btn stop-btn"
-                                                onClick={handleStopDavProcessing}
-                                                style={{ marginLeft: '8px' }}
-                                            >
-                                                Stop processing
-                                            </button>
-                                        )}
-                                    </>
+                                    <button
+                                        className="control-btn start-btn"
+                                        onClick={handleProcessDavFile}
+                                        disabled={davProcessing || !backendConnected}
+                                        style={{ marginLeft: '8px' }}
+                                    >
+                                        {davProcessing ? 'Processing…' : 'Process on server'}
+                                    </button>
                                 )}
                             </div>
                         )}
                         
                         <div className="control-buttons">
-                            <button 
-                                className="control-btn start-btn" 
-                                onClick={handleStart}
-                                disabled={isStreaming || (videoMode === 'file' && !selectedVideoFile) || (videoMode === 'file' && selectedVideoFile && isDavFile(selectedVideoFile))}
-                            >
-                                Start
-                            </button>
-                            <button 
-                                className="control-btn stop-btn" 
-                                onClick={handleStop}
-                                disabled={!isStreaming}
-                            >
-                                Stop
-                            </button>
-                            <button 
-                                className="control-btn snapshot-btn" 
-                                onClick={handleSnapshot}
-                                disabled={!isStreaming}
-                            >
-                                Snapshot
-                            </button>
+                            {videoMode === 'camera' ? (
+                                <>
+                                    <button 
+                                        className="control-btn start-btn" 
+                                        onClick={handleStart}
+                                        disabled={isStreaming}
+                                    >
+                                        Start
+                                    </button>
+                                    <button 
+                                        className="control-btn stop-btn" 
+                                        onClick={handleStop}
+                                        disabled={!isStreaming}
+                                    >
+                                        Stop
+                                    </button>
+                                    <button 
+                                        className="control-btn snapshot-btn" 
+                                        onClick={handleSnapshot}
+                                        disabled={!isStreaming}
+                                    >
+                                        Snapshot
+                                    </button>
+                                </>
+                            ) : (
+                                <>
+                                    <button
+                                        type="button"
+                                        className="control-btn pause-btn"
+                                        onClick={handlePauseResumeDav}
+                                        disabled={!davProcessing}
+                                        title={davPaused ? 'Resume' : 'Pause'}
+                                    >
+                                        {davPaused ? (
+                                            <>
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                                                <span>Resume</span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
+                                                <span>Pause</span>
+                                            </>
+                                        )}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="control-btn stop-btn"
+                                        onClick={handleStopDavProcessing}
+                                        disabled={!davProcessing}
+                                        title="Stop"
+                                    >
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                                        <span>Stop</span>
+                                    </button>
+                                </>
+                            )}
                         </div>
                     </div>
 
                     <div className="video-feed-container">
-                        <div className={`video-feed ${!isStreaming && !davResults?.sample_frames?.length ? 'video-feed-disconnected' : ''}`}>
+                        <div ref={videoFeedContainerRef} className={`video-feed ${!isStreaming && !davResults?.sample_frames?.length ? 'video-feed-disconnected' : ''}`}>
                             <video
                                 ref={videoRef}
                                 autoPlay
@@ -820,9 +1083,33 @@ function Dashboard() {
                                     />
                                     {davProcessing && (
                                         <div style={{ position: 'absolute', top: '8px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.7)', color: '#fff', padding: '6px 12px', borderRadius: '6px', fontSize: '12px' }}>
-                                            Processing… (live)
+                                            {davPaused ? 'Paused' : 'Processing… (live)'}
                                         </div>
                                     )}
+                                </div>
+                            )}
+                            {threatAlert && (
+                                <div style={{ position: 'absolute', top: '8px', right: '8px', zIndex: 10, background: 'rgba(239, 68, 68, 0.9)', color: '#fff', padding: '8px 14px', borderRadius: '8px', fontSize: '13px', fontWeight: '600', boxShadow: '0 2px 8px rgba(0,0,0,0.3)' }}>
+                                    Alert: Person in unrestricted area
+                                </div>
+                            )}
+                            {(isDrawingBoundary || threatBox) && (isStreaming || davLiveFrame) && (
+                                <div
+                                    ref={boundaryOverlayRef}
+                                    className="threat-boundary-overlay"
+                                    style={{
+                                        position: 'absolute', inset: 0, pointerEvents: isDrawingBoundary ? 'auto' : 'none',
+                                        cursor: isDrawingBoundary ? 'crosshair' : 'default', zIndex: 5
+                                    }}
+                                >
+                                    <canvas
+                                        ref={boundaryCanvasRef}
+                                        onMouseDown={handleBoundaryMouseDown}
+                                        onMouseMove={handleBoundaryMouseMove}
+                                        onMouseUp={handleBoundaryMouseUp}
+                                        onMouseLeave={handleBoundaryMouseLeave}
+                                        style={{ width: '100%', height: '100%', display: 'block' }}
+                                    />
                                 </div>
                             )}
                             {davResults?.sample_frames?.length > 0 && !isStreaming && !davLiveFrame && (
@@ -879,7 +1166,13 @@ function Dashboard() {
                     </div>
                     <div className="panel-content">
                         <div className="detection-section">
-                            {occupancyStats ? (
+                            <div className="video-datetime-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', marginBottom: '12px' }}>
+                                <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '8px' }}>Video date / time</div>
+                                <div style={{ fontSize: '15px', fontWeight: '600', color: 'rgba(255,255,255,0.95)', fontFamily: 'monospace' }}>
+                                    {videoDateTime != null && videoDateTime !== '' ? videoDateTime : '—'}
+                                </div>
+                            </div>
+                            {featureTab !== 'threat_detection' && occupancyStats ? (
                                 <div className="occupancy-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)' }}>
                                     <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '14px' }}>Occupancy</div>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
