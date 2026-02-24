@@ -1,0 +1,17 @@
+[Unit]
+Description=CCTV Hackathon Backend (Gunicorn)
+After=network.target
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/cctv_hackathon/backend
+Environment="PATH=/home/ubuntu/cctv_hackathon/backend/venv/bin"
+ExecStart=/home/ubuntu/cctv_hackathon/backend/venv/bin/gunicorn --bind 127.0.0.1:5000 --workers 6 --timeout 7200 --access-logfile - --error-logfile - app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

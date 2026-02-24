@@ -48,8 +48,17 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
 CORS(app, supports_credentials=True)  # Allow credentials for same-origin frontend
 
-if insert_occupancy_buckets:
+# Only push to Oracle when module is loaded AND credentials are set (avoids "Push failed" when not configured)
+_has_oracle_creds = all([
+    os.environ.get('ORACLE_URL'),
+    os.environ.get('ORACLE_USERNAME'),
+    os.environ.get('ORACLE_PASSWORD'),
+])
+OCCUPANCY_PUSH_CONFIGURED = bool(insert_occupancy_buckets and _has_oracle_creds)
+if insert_occupancy_buckets and _has_oracle_creds:
     print("[DB] Oracle occupancy ready: data will be pushed to OCCUPANCY_DATA when video is processed.", flush=True)
+elif insert_occupancy_buckets:
+    print("[DB] Oracle module loaded but ORACLE_URL/USERNAME/PASSWORD not set in .env — push to DB disabled.", flush=True)
 else:
     print("[DB] Oracle occupancy NOT available. Install oracledb and set ORACLE_* in .env to push to DB.", flush=True)
 
@@ -558,6 +567,7 @@ def _stream_dav_frames():
     """
     Generator used by detect_video_file_stream. Yields NDJSON lines: one per frame, then a final 'done' line.
     """
+    print("[Backend] _stream_dav_frames started (reading request body)", flush=True)
     if detector is None:
         yield json.dumps({'error': 'Detector not initialized'}) + '\n'
         yield json.dumps({'done': True, 'success': False}) + '\n'
@@ -573,7 +583,7 @@ def _stream_dav_frames():
         return
 
     # Default: process 1 in 15 frames for speed (detection is expensive). Higher = faster, fewer samples per minute.
-    frame_interval = request.form.get('frame_interval', type=int) or 15
+    frame_interval = request.form.get('frame_interval', type=int) or 30
     max_frames = request.form.get('max_frames', type=int) or 5000
     conf_threshold = request.form.get('conf_threshold', type=float) or 0.15
     frame_interval = max(1, min(frame_interval, 60))
@@ -592,7 +602,7 @@ def _stream_dav_frames():
     occupancy_buckets = {}  # bucket_index -> {max_people}
     last_pushed_minute = -1  # push each minute as it completes during processing
 
-    print(f"[DB] Video file stream starting: filename={filename!r}, push_available={insert_occupancy_buckets is not None}", flush=True)
+    print(f"[DB] Video file stream starting: filename={filename!r}, push_available={OCCUPANCY_PUSH_CONFIGURED}", flush=True)
     paths_to_clean = []
     save_path = None
     try:
@@ -617,8 +627,11 @@ def _stream_dav_frames():
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        if not insert_occupancy_buckets:
-            print("[DB] Cannot push: insert_occupancy_buckets is None (oracle_occupancy not loaded). Check oracledb and .env", flush=True)
+        if not OCCUPANCY_PUSH_CONFIGURED:
+            if insert_occupancy_buckets:
+                print("[DB] Oracle credentials not set in .env — skipping push to OCCUPANCY_DATA.", flush=True)
+            else:
+                print("[DB] Cannot push: oracle_occupancy not loaded. Check oracledb and .env", flush=True)
         else:
             print(f"[DB] Video opened. Will push to OCCUPANCY_DATA as each minute completes. camera={parsed_filename['camera_number']}", flush=True)
         total_frames_in_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -634,7 +647,7 @@ def _stream_dav_frames():
                 frame_index += 1
                 continue
             time_sec = frame_index / fps if fps > 0 else 0
-            people = detector.detect_people(frame, conf_threshold)
+            people = detector.detect_people(frame, conf_threshold, fast_inference=True)
             count = len(people)
             annotated = detector.draw_detections(frame.copy(), people)
             _, buf = cv2.imencode('.jpg', annotated)
@@ -645,7 +658,7 @@ def _stream_dav_frames():
             if prev is None or count > prev['max_people']:
                 occupancy_buckets[bucket_idx] = {'max_people': count}
             # Push completed minutes only (when we've left that minute, so we have final max_people). One row per minute.
-            if insert_occupancy_buckets and bucket_idx > last_pushed_minute + 1:
+            if OCCUPANCY_PUSH_CONFIGURED and bucket_idx > last_pushed_minute + 1:
                 for m in range(last_pushed_minute + 1, bucket_idx):
                     if m in occupancy_buckets:
                         ok, err = insert_occupancy_buckets(
@@ -696,7 +709,7 @@ def _stream_dav_frames():
         db_saved = False
         db_error = None
         db_skip_reason = None
-        if insert_occupancy_buckets and occupancy_buckets:
+        if OCCUPANCY_PUSH_CONFIGURED and occupancy_buckets:
             max_bucket = max(occupancy_buckets.keys())
             for m in range(last_pushed_minute + 1, max_bucket + 1):
                 if m in occupancy_buckets:
@@ -716,7 +729,7 @@ def _stream_dav_frames():
                     else:
                         db_error = err
                         print(f"[DB] Push failed (minute {m}): {err}", flush=True)
-        print(f"[DB] Video stream ended. Buckets: {len(occupancy_buckets)}, last_pushed_minute={last_pushed_minute}, push_available={insert_occupancy_buckets is not None}.", flush=True)
+        print(f"[DB] Video stream ended. Buckets: {len(occupancy_buckets)}, last_pushed_minute={last_pushed_minute}, push_available={OCCUPANCY_PUSH_CONFIGURED}.", flush=True)
         frames_with_people = sum(1 for r in frame_results if r['count'] > 0)
         max_count = max((r['count'] for r in frame_results), default=0)
         avg_count = (sum(r['count'] for r in frame_results) / len(frame_results)) if frame_results else 0
@@ -756,6 +769,7 @@ def detect_video_file_stream():
     Stream person detection on an uploaded video file (.dav or other). Each frame is sent to the client
     as it is processed so the frontend can show live video with detection (like MP4 playback).
     """
+    print("[Backend] POST /api/detect-video-file-stream received", flush=True)
     return Response(
         stream_with_context(_stream_dav_frames()),
         mimetype='application/x-ndjson',
@@ -763,8 +777,13 @@ def detect_video_file_stream():
     )
 
 
+# Initialize detector when app is loaded (e.g. by gunicorn)
+try:
+    init_detector()
+except Exception as e:
+    print(f"Warning: init_detector failed: {e}", flush=True)
+
 if __name__ == '__main__':
     print("Initializing CCTV Hackathon Backend...")
-    init_detector()
     app.run(debug=True, host='0.0.0.0', port=5000)
 

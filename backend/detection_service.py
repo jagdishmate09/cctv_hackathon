@@ -173,7 +173,7 @@ class PeopleDetector:
             indices = indices.flatten()
         return [detections[int(i)] for i in indices]
 
-    def detect_people(self, frame: np.ndarray, conf_threshold: float = 0.2, iou_threshold: float = 0.45) -> List[Dict]:
+    def detect_people(self, frame: np.ndarray, conf_threshold: float = 0.2, iou_threshold: float = 0.45, fast_inference: bool = False) -> List[Dict]:
         """
         Detect people in a video frame, including sitting/static and small (distant) persons.
         Runs on both enhanced and original frame and merges results for more consistent detection.
@@ -182,12 +182,13 @@ class PeopleDetector:
             frame: Input frame as numpy array (BGR format)
             conf_threshold: Confidence threshold (default 0.2 for better recall on static/small people)
             iou_threshold: IoU threshold for NMS (default: 0.45)
+            fast_inference: If True, use 640 imgsz for faster processing (e.g. long DAV streams)
         
         Returns:
             List of detection dictionaries with bbox, confidence, and class
         """
         enhanced_frame = self.enhance_image(frame, fast_mode=True)
-        imgsz = 1280 if max(frame.shape[:2]) >= 720 else 640
+        imgsz = 640 if fast_inference else (1280 if max(frame.shape[:2]) >= 720 else 640)
         conf_lo = max(0.1, conf_threshold * 0.75)
 
         # Pass 1: enhanced frame at main threshold (better for motion/blur)

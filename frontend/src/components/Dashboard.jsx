@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import '../styles/dashboard.css';
 
 const SSO_TOKEN_KEY = 'sso_token';
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 function Dashboard() {
     const navigate = useNavigate();
@@ -128,10 +129,11 @@ function Dashboard() {
             window.history.replaceState({}, '', newPath);
             setSearchParams(params);
         }
-        if (!sessionStorage.getItem(SSO_TOKEN_KEY)) {
-            navigate('/login', { replace: true });
-            return;
-        }
+        // SSO disabled – skip redirect to login so we get direct entry to dashboard
+        // if (!sessionStorage.getItem(SSO_TOKEN_KEY)) {
+        //     navigate('/login', { replace: true });
+        //     return;
+        // }
     }, [navigate, setSearchParams]);
 
     useEffect(() => {
@@ -234,7 +236,7 @@ function Dashboard() {
 
     const checkBackendConnection = async () => {
         try {
-            const response = await fetch('http://localhost:5000/api/health', {
+            const response = await fetch(`${API_BASE}/api/health`, {
                 method: 'GET',
                 timeout: 3000
             });
@@ -349,13 +351,13 @@ function Dashboard() {
         try {
             const formData = new FormData();
             formData.append('video', selectedVideoFile);
-            formData.append('frame_interval', '15');
+            formData.append('frame_interval', '30');
             formData.append('max_frames', '5000');
             formData.append('conf_threshold', '0.15');
             formData.append('save_occupancy_to_db', featureTab === 'occupancy_rate' ? 'true' : 'false');
             const controller = new AbortController();
             davAbortControllerRef.current = controller;
-            const response = await fetch('http://localhost:5000/api/detect-video-file-stream', {
+            const response = await fetch(`${API_BASE}/api/detect-video-file-stream`, {
                 method: 'POST',
                 body: formData,
                 signal: controller.signal,
@@ -428,7 +430,11 @@ function Dashboard() {
                 console.log('DAV processing stopped by user');
                 return;
             }
-            setDetectionError(err.message || 'Failed to process DAV file');
+            const msg = err.message || 'Failed to process DAV file';
+            const isNetwork = /fetch|network|connection/i.test(msg);
+            setDetectionError(isNetwork
+                ? 'Connection lost. Long videos can take many minutes — if it stopped after ~5–10 min, the server may have timed out. Try a shorter clip or click Retry Connection.'
+                : msg);
             console.error(err);
         } finally {
             davAbortControllerRef.current = null;
@@ -658,7 +664,7 @@ function Dashboard() {
             };
             
             console.log('Sending detection request to API...');
-            const response = await fetch('http://localhost:5000/api/detect', {
+            const response = await fetch(`${API_BASE}/api/detect`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
