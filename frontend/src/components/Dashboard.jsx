@@ -351,10 +351,12 @@ function Dashboard() {
         try {
             const formData = new FormData();
             formData.append('video', selectedVideoFile);
-            formData.append('frame_interval', '30');
+            formData.append('frame_interval', '50');
             formData.append('max_frames', '5000');
             formData.append('conf_threshold', '0.15');
             formData.append('save_occupancy_to_db', featureTab === 'occupancy_rate' ? 'true' : 'false');
+            // Occupancy rate/analysis → CAM-03 (Meeting Room); Threat detection → CAM-09 (Restricted)
+            formData.append('camera_id', featureTab === 'threat_detection' ? 'CAM-09' : 'CAM-03');
             const controller = new AbortController();
             davAbortControllerRef.current = controller;
             const response = await fetch(`${API_BASE}/api/detect-video-file-stream`, {

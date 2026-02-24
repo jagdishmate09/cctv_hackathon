@@ -33,16 +33,27 @@ REDIRECT_URI = os.environ.get('REDIRECT_URI', 'http://localhost:5000/auth/micros
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'change-me-in-production')
 
-# Try to import PeopleDetector, but allow server to start even if it fails
+# Use agentic pipeline (multi-model YOLO, motion, presence, policy, alerts)
 try:
-    from detection_service import PeopleDetector, extract_video_datetime
+    from agentic_detection_service import (
+        AgenticPeopleDetector,
+        AgenticVideoProcessor,
+        extract_video_datetime,
+    )
     DETECTOR_AVAILABLE = True
 except Exception as e:
-    print(f"Warning: Could not import PeopleDetector: {e}")
-    print("Server will start but detection features will be disabled.")
-    PeopleDetector = None
-    extract_video_datetime = lambda frame: None
-    DETECTOR_AVAILABLE = False
+    print(f"Warning: Could not import agentic detector: {e}")
+    print("Falling back to original detection_service.")
+    try:
+        from detection_service import PeopleDetector as AgenticPeopleDetector, extract_video_datetime
+        AgenticVideoProcessor = None  # video endpoints will use single-frame detector per frame
+        DETECTOR_AVAILABLE = True
+    except Exception as e2:
+        print(f"Warning: Could not import PeopleDetector: {e2}")
+        AgenticPeopleDetector = None
+        AgenticVideoProcessor = None
+        extract_video_datetime = lambda frame: None
+        DETECTOR_AVAILABLE = False
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
@@ -161,17 +172,20 @@ def auth_verify():
 detector = None
 
 def init_detector():
-    """Initialize the people detector"""
+    """Initialize the agentic people detector (multi-model YOLO, policy, motion)."""
     global detector
     if not DETECTOR_AVAILABLE:
         print("Detector not available - detection features disabled")
         detector = None
         return
-    
     try:
-        # Using yolov8s.pt for better accuracy (can switch to yolov8m.pt for even better accuracy)
-        detector = PeopleDetector('yolov8s.pt')
-        print("People detector initialized successfully")
+        detector = AgenticPeopleDetector(
+            model_low='yolov10n.pt',
+            model_med='yolov10s.pt',
+            model_high='yolov10m.pt',
+            default_mode='MED',
+        )
+        print("Agentic people detector initialized successfully")
     except Exception as e:
         print(f"Error initializing detector: {e}")
         print("Server will continue without detection features")
@@ -435,7 +449,7 @@ def detect_video_file():
     Uses FFmpeg to convert .dav (Dahua) to a temporary format OpenCV can read.
 
     Request: multipart/form-data with field "video" (file).
-    Optional form fields: frame_interval (int, default 10), max_frames (int, default 500), conf_threshold (float, default 0.25).
+    Optional form fields: frame_interval (int, default 50), max_frames (int, default 500), conf_threshold (float, default 0.25).
 
     Returns: JSON with per-frame counts and summary.
     """
@@ -449,9 +463,10 @@ def detect_video_file():
     if not file or file.filename == '':
         return jsonify({'success': False, 'error': 'No video file selected'}), 400
 
-    frame_interval = request.form.get('frame_interval', type=int) or 10
+    frame_interval = request.form.get('frame_interval', type=int) or 50
     max_frames = request.form.get('max_frames', type=int) or 500
     conf_threshold = request.form.get('conf_threshold', type=float) or 0.25
+    camera_id = request.form.get('camera_id') or None
 
     frame_interval = max(1, min(frame_interval, 100))
     max_frames = max(1, min(max_frames, 2000))
@@ -494,6 +509,13 @@ def detect_video_file():
         max_count_so_far = -1
         best_frame_b64 = None
 
+        # Use agentic video pipeline when available (motion, mode, presence, alerts)
+        use_agentic_video = AgenticVideoProcessor is not None
+        if use_agentic_video:
+            from datetime import timedelta
+            video_processor = AgenticVideoProcessor(camera_id=camera_id)
+            start_ts = datetime.utcnow()
+
         while frames_processed < max_frames:
             ret, frame = cap.read()
             if not ret:
@@ -502,8 +524,14 @@ def detect_video_file():
                 frame_index += 1
                 continue
             time_sec = frame_index / fps if fps > 0 else 0
-            detections = detector.detect_people(frame, conf_threshold)
-            count = len(detections)
+            if use_agentic_video:
+                ts = start_ts + timedelta(seconds=time_sec)
+                out = video_processor.process_frame(frame, ts=ts, frame_index=frame_index, fps=fps)
+                detections = out['detections']
+                count = out['count']
+            else:
+                detections = detector.detect_people(frame, conf_threshold)
+                count = len(detections)
             annotated = detector.draw_detections(frame.copy(), detections)
             _, buf = cv2.imencode('.jpg', annotated)
             frame_b64 = base64.b64encode(buf).decode('utf-8')
@@ -583,7 +611,7 @@ def _stream_dav_frames():
         return
 
     # Default: process 1 in 15 frames for speed (detection is expensive). Higher = faster, fewer samples per minute.
-    frame_interval = request.form.get('frame_interval', type=int) or 30
+    frame_interval = request.form.get('frame_interval', type=int) or 50
     max_frames = request.form.get('max_frames', type=int) or 5000
     conf_threshold = request.form.get('conf_threshold', type=float) or 0.15
     frame_interval = max(1, min(frame_interval, 60))
@@ -639,6 +667,13 @@ def _stream_dav_frames():
         frames_processed = 0
         frame_results = []
 
+        use_agentic_video = AgenticVideoProcessor is not None
+        if use_agentic_video:
+            from datetime import timedelta
+            stream_camera_id = request.form.get('camera_id') or (parsed_filename.get('camera_number') if parsed_filename else None)
+            video_processor = AgenticVideoProcessor(camera_id=stream_camera_id)
+            start_ts = datetime.utcnow()
+
         while frames_processed < max_frames:
             ret, frame = cap.read()
             if not ret:
@@ -647,8 +682,14 @@ def _stream_dav_frames():
                 frame_index += 1
                 continue
             time_sec = frame_index / fps if fps > 0 else 0
-            people = detector.detect_people(frame, conf_threshold, fast_inference=True)
-            count = len(people)
+            if use_agentic_video:
+                ts = start_ts + timedelta(seconds=time_sec)
+                out = video_processor.process_frame(frame, ts=ts, frame_index=frame_index, fps=fps)
+                people = out['detections']
+                count = out['count']
+            else:
+                people = detector.detect_people(frame, conf_threshold, fast_inference=True)
+                count = len(people)
             annotated = detector.draw_detections(frame.copy(), people)
             _, buf = cv2.imencode('.jpg', annotated)
             frame_b64 = base64.b64encode(buf).decode('utf-8')
@@ -690,6 +731,11 @@ def _stream_dav_frames():
                 'frame_width': fw,
                 'frame_height': fh,
             }
+            if use_agentic_video and out.get('mode') is not None:
+                payload['agent_mode'] = out['mode']
+                payload['presence_seconds'] = out.get('presence_seconds')
+                if out.get('alert'):
+                    payload['alert'] = out['alert']
             # Include parsed filename info for frontend (camera name, video date/time)
             if parsed_filename:
                 h, m, s = parsed_filename['start_hour'], parsed_filename['start_min'], parsed_filename['start_sec']

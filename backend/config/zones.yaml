@@ -1,0 +1,33 @@
+cameras:
+  CAM-03:
+    zone_name: "Meeting Room 2"
+    zone_type: "UNRESTRICTED"
+    allowed_days: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    allowed_time: ["00:00","23:59"]
+    allowed_occupancy: 8
+    min_presence_seconds: 0
+    person_conf_threshold: 0.10
+    roi:
+      polygon: []
+
+  CAM-09:
+    zone_name: "Restricted Room"
+    zone_type: "RESTRICTED"
+    allowed_days: ["Mon","Tue","Wed","Thu","Fri"]
+    allowed_time: ["09:00","19:00"]
+    allowed_occupancy: 1
+    min_presence_seconds: 3
+    person_conf_threshold: 0.10
+    roi:
+      polygon: []
+
+  default:
+    zone_name: "Default Zone"
+    zone_type: "UNRESTRICTED"
+    allowed_days: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    allowed_time: ["00:00","23:59"]
+    allowed_occupancy: 99
+    min_presence_seconds: 0
+    person_conf_threshold: 0.10
+    roi:
+      polygon: []
