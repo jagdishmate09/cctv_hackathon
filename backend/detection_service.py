@@ -65,6 +65,7 @@ class PeopleDetector:
         """
         self.model = YOLO(model_path)
         self.model.fuse()  # Fuse model for faster inference
+        self._log_frame_count = 0  # log every N frames to avoid spam
         print(f"YOLOv8 model ({model_path}) loaded successfully")
     
     def enhance_image(self, frame: np.ndarray, fast_mode: bool = True) -> np.ndarray:
@@ -195,9 +196,10 @@ class PeopleDetector:
         dets_original = self._run_inference(frame, conf_lo, imgsz)
         merged = self._nms_merge(dets_enhanced + dets_original, iou_threshold=iou_threshold)
 
-        print(f"[Detector] Frame {frame.shape} imgsz={imgsz} conf={conf_threshold} -> enhanced={len(dets_enhanced)} original={len(dets_original)} -> merged={len(merged)}")
-        for i, d in enumerate(merged):
-            print(f"[Detector] Detection {i+1}: conf={d['confidence']:.3f}, bbox={d['bbox']}")
+        # Log at most every 50 frames to reduce I/O and keep [DB] lines visible
+        self._log_frame_count += 1
+        if self._log_frame_count % 50 == 1 or len(merged) == 0:
+            print(f"[Detector] Frame {frame.shape} imgsz={imgsz} conf={conf_threshold} -> enhanced={len(dets_enhanced)} original={len(dets_original)} -> merged={len(merged)}", flush=True)
         return merged
 
     def detect_chairs(self, frame: np.ndarray, conf_threshold: float = 0.15) -> List[Dict]:

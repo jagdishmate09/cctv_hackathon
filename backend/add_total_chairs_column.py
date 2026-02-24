@@ -1,7 +1,6 @@
 """
-Convert TOTAL_CHAIRS and OCCUPANCY_RATE to virtual columns.
-Run this if you already created OCCUPANCY_DATA with these as regular columns.
-Drops the columns and re-adds them as VIRTUAL (generated).
+Add TOTAL_CHAIRS and OCCUPANCY_RATE as virtual columns (if table had no virtual cols).
+Or: ensure chair columns exist and are nullable; app does not insert chair data.
 Usage: cd backend && python add_total_chairs_column.py
 """
 import os

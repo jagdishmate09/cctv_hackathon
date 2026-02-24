@@ -25,8 +25,10 @@ function Dashboard() {
     const [davPaused, setDavPaused] = useState(false);
     const [davResults, setDavResults] = useState(null);
     const [davLiveFrame, setDavLiveFrame] = useState(null);
-    const [occupancyStats, setOccupancyStats] = useState(null); // { total_people, unoccupied_chairs, occupied_chairs, total_chairs, occupancy_rate }
-    const [videoDateTime, setVideoDateTime] = useState(null);   // date/time extracted from video (top-right OSD)
+    const [occupancyStats, setOccupancyStats] = useState(null); // { total_people }
+    const [videoDateTime, setVideoDateTime] = useState(null);   // date/time from video OSD or parsed filename
+    const [parsedCameraName, setParsedCameraName] = useState(null);   // camera from uploaded DAV filename
+    const [parsedVideoDateTime, setParsedVideoDateTime] = useState(null);   // date/time from DAV filename
     const [featureTab, setFeatureTab] = useState('occupancy_rate'); // 'occupancy_rate' | 'occupancy_analysis' | 'threat_detection'
     const [threatBox, setThreatBox] = useState(null);                 // { x1, y1, x2, y2 } normalized 0-1 (red box)
     const [isDrawingBoundary, setIsDrawingBoundary] = useState(false);
@@ -338,6 +340,8 @@ function Dashboard() {
         setDavProcessing(true);
         setDavPaused(false);
         davPausedRef.current = false;
+        setParsedCameraName(null);
+        setParsedVideoDateTime(null);
         setDavResults(null);
         setDavLiveFrame(null);
                         setOccupancyStats(null);
@@ -345,10 +349,9 @@ function Dashboard() {
         try {
             const formData = new FormData();
             formData.append('video', selectedVideoFile);
-            formData.append('frame_interval', '5');
-            formData.append('max_frames', '2000');
+            formData.append('frame_interval', '15');
+            formData.append('max_frames', '5000');
             formData.append('conf_threshold', '0.15');
-            formData.append('draw_chairs', featureTab === 'threat_detection' ? 'false' : 'true');
             formData.append('save_occupancy_to_db', featureTab === 'occupancy_rate' ? 'true' : 'false');
             const controller = new AbortController();
             davAbortControllerRef.current = controller;
@@ -382,6 +385,8 @@ function Dashboard() {
                         if (data.frame !== undefined && !davPausedRef.current) {
                             setDavLiveFrame(data.frame);
                             if (data.video_datetime != null) setVideoDateTime(data.video_datetime);
+                            if (data.parsed_camera_name != null) setParsedCameraName(data.parsed_camera_name);
+                            if (data.parsed_video_date_time != null) setParsedVideoDateTime(data.parsed_video_date_time);
                             if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
                             checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
                             const dets = data.detections || [];
@@ -397,13 +402,7 @@ function Dashboard() {
                                 detections: dets,
                                 stats,
                             });
-                            if (data.total_people != null || data.occupancy_rate != null) setOccupancyStats({
-                                total_people: data.total_people ?? data.count ?? 0,
-                                unoccupied_chairs: data.unoccupied_chairs ?? data.chair_count ?? 0,
-                                occupied_chairs: data.occupied_chairs ?? data.count ?? 0,
-                                total_chairs: data.total_chairs ?? 0,
-                                occupancy_rate: data.occupancy_rate ?? null,
-                            });
+                            if (data.total_people != null) setOccupancyStats({ total_people: data.total_people ?? data.count ?? 0 });
                         }
                         if (data.done) {
                             lastSummary = data;
@@ -681,13 +680,7 @@ function Dashboard() {
                         detections: data.detections || [],
                         stats: data.stats || null
                     });
-                    if (data.total_people != null || data.occupancy_rate != null) setOccupancyStats({
-                        total_people: data.total_people ?? data.count ?? 0,
-                        unoccupied_chairs: data.unoccupied_chairs ?? data.chair_count ?? 0,
-                        occupied_chairs: data.occupied_chairs ?? data.count ?? 0,
-                        total_chairs: data.total_chairs ?? 0,
-                        occupancy_rate: data.occupancy_rate ?? null,
-                    });
+                    if (data.total_people != null) setOccupancyStats({ total_people: data.total_people ?? data.count ?? 0 });
                     if (data.video_datetime != null) setVideoDateTime(data.video_datetime);
                     if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
                     checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
@@ -858,26 +851,16 @@ function Dashboard() {
                         <div className="feature-tab-content">
                             {featureTab === 'occupancy_rate' && (
                                 <div className="feature-pane">
-                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>Current occupancy</div>
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>People count</div>
                                     {occupancyStats ? (
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
-                                                <span style={{ color: 'rgba(255,255,255,0.85)' }}>Occupancy rate</span>
-                                                <span style={{ fontWeight: '600', color: 'var(--accent-color, #4ade80)' }}>
-                                                    {occupancyStats.occupancy_rate != null ? `${Number(occupancyStats.occupancy_rate).toFixed(1)}%` : '—'}
-                                                </span>
-                                            </div>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
                                                 <span style={{ color: 'rgba(255,255,255,0.85)' }}>People</span>
                                                 <span style={{ fontWeight: '600' }}>{occupancyStats.total_people}</span>
                                             </div>
-                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
-                                                <span style={{ color: 'rgba(255,255,255,0.85)' }}>Total chairs</span>
-                                                <span style={{ fontWeight: '600' }}>{occupancyStats.total_chairs}</span>
-                                            </div>
                                         </div>
                                     ) : (
-                                        <p className="placeholder-text" style={{ marginTop: '8px' }}>Start video or process a file to see occupancy rate.</p>
+                                        <p className="placeholder-text" style={{ marginTop: '8px' }}>Start video or process a file to see people count.</p>
                                     )}
                                 </div>
                             )}
@@ -1167,37 +1150,23 @@ function Dashboard() {
                     <div className="panel-content">
                         <div className="detection-section">
                             <div className="video-datetime-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', marginBottom: '12px' }}>
+                                <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '8px' }}>Camera</div>
+                                <div style={{ fontSize: '15px', fontWeight: '600', color: 'rgba(255,255,255,0.95)', fontFamily: 'monospace' }}>
+                                    {parsedCameraName != null && parsedCameraName !== '' ? parsedCameraName : '—'}
+                                </div>
+                            </div>
+                            <div className="video-datetime-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', marginBottom: '12px' }}>
                                 <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '8px' }}>Video date / time</div>
                                 <div style={{ fontSize: '15px', fontWeight: '600', color: 'rgba(255,255,255,0.95)', fontFamily: 'monospace' }}>
-                                    {videoDateTime != null && videoDateTime !== '' ? videoDateTime : '—'}
+                                    {(parsedVideoDateTime != null && parsedVideoDateTime !== '') ? parsedVideoDateTime : (videoDateTime != null && videoDateTime !== '' ? videoDateTime : '—')}
                                 </div>
                             </div>
                             {featureTab !== 'threat_detection' && occupancyStats ? (
                                 <div className="occupancy-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)' }}>
-                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '14px' }}>Occupancy</div>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total people</span>
-                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_people}</span>
-                                        </div>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total unoccupied chairs</span>
-                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.unoccupied_chairs}</span>
-                                        </div>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total occupied chairs</span>
-                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.occupied_chairs}</span>
-                                        </div>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total chairs</span>
-                                            <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_chairs}</span>
-                                        </div>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 0 4px' }}>
-                                            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Occupancy rate</span>
-                                            <span style={{ fontSize: '16px', fontWeight: '700', color: 'var(--accent-color, #4ade80)' }}>
-                                                {occupancyStats.occupancy_rate != null ? `${Number(occupancyStats.occupancy_rate).toFixed(1)}%` : '—'}
-                                            </span>
-                                        </div>
+                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '14px' }}>People count</div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0' }}>
+                                        <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total people</span>
+                                        <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_people}</span>
                                     </div>
                                 </div>
                             ) : null}
