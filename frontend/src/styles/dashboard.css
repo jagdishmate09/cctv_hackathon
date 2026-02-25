@@ -191,6 +191,38 @@ html, body {
     min-height: 0;
 }
 
+.right-panel .panel-content {
+    overflow-y: auto;
+}
+
+.system-status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 10px;
+}
+
+.system-status-card {
+    padding: 8px 10px;
+    background: rgba(0,0,0,0.25);
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.08);
+}
+
+.system-status-card .label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: rgba(255,255,255,0.6);
+    margin-bottom: 4px;
+}
+
+.system-status-card .value {
+    font-size: 13px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.95);
+    font-family: monospace;
+}
+
 .placeholder-text {
     font-size: 13px;
     color: #64748b;
@@ -252,6 +284,10 @@ html, body {
     display: flex;
     flex-direction: column;
     gap: 20px;
+}
+
+.right-panel .detection-section {
+    gap: 8px;
 }
 
 .detection-card {

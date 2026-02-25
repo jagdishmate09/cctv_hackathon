@@ -21,8 +21,8 @@ This folder contains deployment config used on this server.
    Then: `sudo systemctl restart cctv-backend`
 
 2. **Frontend:**  
-   `cd frontend && git pull && npm install && VITE_API_URL= npm run build`  
-   Then: `sudo cp -r dist/* /var/www/cctv/`
+   From repo root: `./frontend/deploy-frontend.sh`  
+   (Or: `cd frontend && npm run build` then `sudo cp -r dist/* /var/www/cctv/`)
 
 3. **Env:**  
    Edit `backend/.env` (e.g. Microsoft SSO, `REDIRECT_URI`, `FRONTEND_URL`) and restart:  

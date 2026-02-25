@@ -421,6 +421,50 @@ def _dav_to_mp4_temp(dav_path: str) -> str:
         raise
 
 
+def _is_room_lighted(frame, threshold=45):
+    """Return True if frame mean luminance >= threshold, False if dark, None if no frame."""
+    if frame is None or frame.size == 0:
+        return None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(gray.mean()) >= threshold
+
+
+_camera_mapping_cache = None
+
+
+def _get_room_type(camera_id: str) -> str | None:
+    """Return room_type for camera from config/camera_mapping.json, or None if not found."""
+    global _camera_mapping_cache
+    if camera_id is None or not str(camera_id).strip():
+        return None
+    if _camera_mapping_cache is None:
+        tried = []
+        for base in [
+            Path(__file__).resolve().parent,  # backend/
+            Path(__file__).resolve().parent.parent / "backend_new",  # backend_new/
+            Path.cwd(),
+        ]:
+            mapping_path = base / "config" / "camera_mapping.json"
+            tried.append(str(mapping_path))
+            if mapping_path.is_file():
+                try:
+                    with open(mapping_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    _camera_mapping_cache = data.get("camera_mapping") or {}
+                    break
+                except Exception:
+                    pass
+        if _camera_mapping_cache is None:
+            _camera_mapping_cache = {}
+    key = str(camera_id).strip().upper()
+    if key.isdigit():
+        key = f"CH{key}"
+    entry = _camera_mapping_cache.get(key)
+    if isinstance(entry, dict):
+        return entry.get("room_type")
+    return None
+
+
 def _video_path_for_opencv(file_path: str) -> tuple:
     """
     Return (path_to_open, temp_path_or_none).
@@ -730,13 +774,14 @@ def _stream_dav_frames():
                 'video_datetime': video_datetime,
                 'frame_width': fw,
                 'frame_height': fh,
+                'room_lighted': _is_room_lighted(frame),
             }
             if use_agentic_video and out.get('mode') is not None:
                 payload['agent_mode'] = out['mode']
                 payload['presence_seconds'] = out.get('presence_seconds')
                 if out.get('alert'):
                     payload['alert'] = out['alert']
-            # Include parsed filename info for frontend (camera name, video date/time)
+            # Include parsed filename info for frontend (camera name, video date/time, room type)
             if parsed_filename:
                 h, m, s = parsed_filename['start_hour'], parsed_filename['start_min'], parsed_filename['start_sec']
                 # Format: DD/MM/YYYY, HH:MM:SS (from YYYY-MM-DD)
@@ -746,6 +791,11 @@ def _stream_dav_frames():
                 time_display = f"{h:02d}:{m:02d}:{s:02d}"
                 payload['parsed_camera_name'] = parsed_filename['camera_number']
                 payload['parsed_video_date_time'] = f"{date_display}, {time_display}"
+                payload['parsed_video_date'] = date_display
+                payload['parsed_video_time'] = time_display
+                room_type = _get_room_type(parsed_filename['camera_number'])
+                if room_type is not None:
+                    payload['room_type'] = room_type
             yield json.dumps(payload) + '\n'
             frames_processed += 1
             frame_index += 1

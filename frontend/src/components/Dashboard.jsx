@@ -30,6 +30,11 @@ function Dashboard() {
     const [videoDateTime, setVideoDateTime] = useState(null);   // date/time from video OSD or parsed filename
     const [parsedCameraName, setParsedCameraName] = useState(null);   // camera from uploaded DAV filename
     const [parsedVideoDateTime, setParsedVideoDateTime] = useState(null);   // date/time from DAV filename
+    const [parsedVideoDate, setParsedVideoDate] = useState(null);   // date only (from backend or split)
+    const [parsedVideoTime, setParsedVideoTime] = useState(null);   // time only (from backend or split)
+    const [roomLighted, setRoomLighted] = useState(null);   // true = lighted, false = not lighted, null = unknown
+    const [roomType, setRoomType] = useState(null);         // from camera_mapping e.g. floor, conference_room
+    const [cameraMapping, setCameraMapping] = useState(null); // { CH1: { room_type }, ... } fallback when backend doesn't send room_type
     const [featureTab, setFeatureTab] = useState('occupancy_rate'); // 'occupancy_rate' | 'occupancy_analysis' | 'threat_detection'
     const [threatBox, setThreatBox] = useState(null);                 // { x1, y1, x2, y2 } normalized 0-1 (red box)
     const [isDrawingBoundary, setIsDrawingBoundary] = useState(false);
@@ -49,6 +54,23 @@ function Dashboard() {
     const boundaryOverlayRef = useRef(null);
     const threatBoxRef = useRef(null);
     useEffect(() => { threatBoxRef.current = threatBox; }, [threatBox]);
+
+    // Load camera_mapping.json for frontend fallback (room type when backend doesn't send it)
+    useEffect(() => {
+        fetch('/camera_mapping.json')
+            .then((r) => r.ok ? r.json() : null)
+            .then((data) => data?.camera_mapping && setCameraMapping(data.camera_mapping))
+            .catch(() => {});
+    }, []);
+
+    const getRoomTypeForCamera = (cameraName) => {
+        if (!cameraName || !cameraMapping) return null;
+        const s = String(cameraName).trim().toUpperCase();
+        const key = /^\d+$/.test(s) ? `CH${s}` : s.startsWith('CH') ? s : `CH${s}`;
+        const entry = cameraMapping[key];
+        return entry?.room_type ?? null;
+    };
+    const displayRoomType = roomType ?? (parsedCameraName ? getRoomTypeForCamera(parsedCameraName) : null);
 
     const getNormalizedCoords = (e) => {
         const el = isStreaming ? videoRef.current : (davLiveFrame && davLiveImgRef.current) ? davLiveImgRef.current : null;
@@ -344,6 +366,10 @@ function Dashboard() {
         davPausedRef.current = false;
         setParsedCameraName(null);
         setParsedVideoDateTime(null);
+        setParsedVideoDate(null);
+        setParsedVideoTime(null);
+        setRoomLighted(null);
+        setRoomType(null);
         setDavResults(null);
         setDavLiveFrame(null);
                         setOccupancyStats(null);
@@ -391,6 +417,10 @@ function Dashboard() {
                             if (data.video_datetime != null) setVideoDateTime(data.video_datetime);
                             if (data.parsed_camera_name != null) setParsedCameraName(data.parsed_camera_name);
                             if (data.parsed_video_date_time != null) setParsedVideoDateTime(data.parsed_video_date_time);
+                            if (data.parsed_video_date != null) setParsedVideoDate(data.parsed_video_date);
+                            if (data.parsed_video_time != null) setParsedVideoTime(data.parsed_video_time);
+                            if (data.room_lighted !== undefined && data.room_lighted !== null) setRoomLighted(data.room_lighted);
+                            if (data.room_type != null) setRoomType(data.room_type);
                             if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
                             checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
                             const dets = data.detections || [];
@@ -1157,27 +1187,37 @@ function Dashboard() {
                     </div>
                     <div className="panel-content">
                         <div className="detection-section">
-                            <div className="video-datetime-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', marginBottom: '12px' }}>
-                                <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '8px' }}>Camera</div>
-                                <div style={{ fontSize: '15px', fontWeight: '600', color: 'rgba(255,255,255,0.95)', fontFamily: 'monospace' }}>
-                                    {parsedCameraName != null && parsedCameraName !== '' ? parsedCameraName : '—'}
+                            <div className="system-status-grid">
+                                <div className="system-status-card">
+                                    <div className="label">Camera</div>
+                                    <div className="value">{parsedCameraName != null && parsedCameraName !== '' ? parsedCameraName : '—'}</div>
                                 </div>
-                            </div>
-                            <div className="video-datetime-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)', marginBottom: '12px' }}>
-                                <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '8px' }}>Video date / time</div>
-                                <div style={{ fontSize: '15px', fontWeight: '600', color: 'rgba(255,255,255,0.95)', fontFamily: 'monospace' }}>
-                                    {(parsedVideoDateTime != null && parsedVideoDateTime !== '') ? parsedVideoDateTime : (videoDateTime != null && videoDateTime !== '' ? videoDateTime : '—')}
+                                <div className="system-status-card">
+                                    <div className="label">Video date</div>
+                                    <div className="value">{parsedVideoDate != null && parsedVideoDate !== '' ? parsedVideoDate : (parsedVideoDateTime != null ? parsedVideoDateTime.split(/,/)[0]?.trim() : (videoDateTime != null ? videoDateTime.split(/\s+/)[0] || videoDateTime : '—'))}</div>
                                 </div>
-                            </div>
-                            {featureTab !== 'threat_detection' && occupancyStats ? (
-                                <div className="occupancy-card" style={{ padding: '16px', background: 'rgba(0,0,0,0.25)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.08)' }}>
-                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '14px' }}>People count</div>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0' }}>
-                                        <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.85)' }}>Total people</span>
-                                        <span style={{ fontSize: '14px', fontWeight: '600' }}>{occupancyStats.total_people}</span>
+                                <div className="system-status-card">
+                                    <div className="label">Video time</div>
+                                    <div className="value">{parsedVideoTime != null && parsedVideoTime !== '' ? parsedVideoTime : (parsedVideoDateTime != null ? parsedVideoDateTime.split(/,/)[1]?.trim() : (videoDateTime != null ? videoDateTime.split(/\s+/).slice(1).join(' ') || videoDateTime : '—'))}</div>
+                                </div>
+                                <div className="system-status-card">
+                                    <div className="label">Lighting</div>
+                                    <div className="value" style={{ color: roomLighted === true ? 'rgba(100,220,120,0.95)' : roomLighted === false ? 'rgba(255,180,100,0.95)' : undefined }}>{roomLighted === true ? 'Lighted' : roomLighted === false ? 'Not lighted' : '—'}</div>
+                                </div>
+                                <div className="system-status-card">
+                                    <div className="label">Room type</div>
+                                    <div className="value">{displayRoomType != null && displayRoomType !== '' ? displayRoomType.replace(/_/g, ' ') : '—'}</div>
+                                </div>
+                                {featureTab !== 'threat_detection' && occupancyStats ? (
+                                    <div className="system-status-card" style={{ gridColumn: '1 / -1' }}>
+                                        <div className="label">People count</div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '13px' }}>
+                                            <span style={{ color: 'rgba(255,255,255,0.85)' }}>Total people</span>
+                                            <span className="value" style={{ margin: 0 }}>{occupancyStats.total_people}</span>
+                                        </div>
                                     </div>
-                                </div>
-                            ) : null}
+                                ) : null}
+                            </div>
 
                             {davResults && davResults.success && (
                                 <div className="detection-status" style={{ marginTop: '12px', padding: '12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
