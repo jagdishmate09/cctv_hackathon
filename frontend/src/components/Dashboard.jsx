@@ -1,9 +1,14 @@
 import { useState, useRef, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import OccupancyAnalysis from './OccupancyAnalysis';
+import { API_BASE } from '../api';
 import '../styles/dashboard.css';
 
 const SSO_TOKEN_KEY = 'sso_token';
-const API_BASE = import.meta.env.VITE_API_URL || '';
+
+// Motion score thresholds for model display (match backend_new agent: motion_to_med = 0.02)
+const MOTION_THRESHOLD_MED = 0.02;   // >= this → MED (yolov10s)
+const MOTION_THRESHOLD_HIGH = 0.05;  // >= this → HIGH (yolov10m)
 
 function Dashboard() {
     const navigate = useNavigate();
@@ -35,6 +40,8 @@ function Dashboard() {
     const [roomLighted, setRoomLighted] = useState(null);   // true = lighted, false = not lighted, null = unknown
     const [roomType, setRoomType] = useState(null);         // from camera_mapping e.g. floor, conference_room
     const [cameraMapping, setCameraMapping] = useState(null); // { CH1: { room_type }, ... } fallback when backend doesn't send room_type
+    const [motionScore, setMotionScore] = useState(null);   // from backend_new motion logic (display only)
+    const [brightnessScore, setBrightnessScore] = useState(null); // 0-255 mean luminance (display only)
     const [featureTab, setFeatureTab] = useState('occupancy_rate'); // 'occupancy_rate' | 'occupancy_analysis' | 'threat_detection'
     const [threatBox, setThreatBox] = useState(null);                 // { x1, y1, x2, y2 } normalized 0-1 (red box)
     const [isDrawingBoundary, setIsDrawingBoundary] = useState(false);
@@ -71,6 +78,16 @@ function Dashboard() {
         return entry?.room_type ?? null;
     };
     const displayRoomType = roomType ?? (parsedCameraName ? getRoomTypeForCamera(parsedCameraName) : null);
+
+    // Derive model from motion score using thresholds (display only)
+    const modelFromMotion = (() => {
+        if (motionScore == null || motionScore === '') return null;
+        const s = Number(motionScore);
+        if (Number.isNaN(s)) return null;
+        if (s >= MOTION_THRESHOLD_HIGH) return { mode: 'HIGH', model: 'yolov10m' };
+        if (s >= MOTION_THRESHOLD_MED) return { mode: 'MED', model: 'yolov10s' };
+        return { mode: 'LOW', model: 'yolov10n' };
+    })();
 
     const getNormalizedCoords = (e) => {
         const el = isStreaming ? videoRef.current : (davLiveFrame && davLiveImgRef.current) ? davLiveImgRef.current : null;
@@ -151,11 +168,9 @@ function Dashboard() {
             window.history.replaceState({}, '', newPath);
             setSearchParams(params);
         }
-        // SSO disabled – skip redirect to login so we get direct entry to dashboard
-        // if (!sessionStorage.getItem(SSO_TOKEN_KEY)) {
-        //     navigate('/login', { replace: true });
-        //     return;
-        // }
+        if (!sessionStorage.getItem(SSO_TOKEN_KEY)) {
+            navigate('/login', { replace: true });
+        }
     }, [navigate, setSearchParams]);
 
     useEffect(() => {
@@ -370,6 +385,8 @@ function Dashboard() {
         setParsedVideoTime(null);
         setRoomLighted(null);
         setRoomType(null);
+        setMotionScore(null);
+        setBrightnessScore(null);
         setDavResults(null);
         setDavLiveFrame(null);
                         setOccupancyStats(null);
@@ -421,6 +438,8 @@ function Dashboard() {
                             if (data.parsed_video_time != null) setParsedVideoTime(data.parsed_video_time);
                             if (data.room_lighted !== undefined && data.room_lighted !== null) setRoomLighted(data.room_lighted);
                             if (data.room_type != null) setRoomType(data.room_type);
+                            if (data.motion_score !== undefined && data.motion_score !== null) setMotionScore(data.motion_score);
+                            if (data.brightness_score !== undefined && data.brightness_score !== null) setBrightnessScore(data.brightness_score);
                             if (data.frame_width != null && data.frame_height != null) setLastFrameDimensions({ w: data.frame_width, h: data.frame_height });
                             checkThreatInFrame(data.detections || [], data.frame_width, data.frame_height);
                             const dets = data.detections || [];
@@ -830,7 +849,7 @@ function Dashboard() {
         <div className="dashboard-container">
             <div className="dashboard-top-bar">
                 <div className="logo-section">
-                    <span className="logo-text">IntelliSpace AI</span>
+                    <span className="logo-text">VisionForge AI</span>
                 </div>
                 <div className="header-bar">
                     <button 
@@ -856,7 +875,7 @@ function Dashboard() {
                 </div>
             </div>
 
-            <div className="dashboard-content">
+            <div className={`dashboard-content ${featureTab === 'occupancy_analysis' ? 'occupancy-analysis-active' : ''}`}>
                 {/* Left Panel - Features */}
                 <div className="left-panel">
                     <div className="panel-header">
@@ -904,8 +923,7 @@ function Dashboard() {
                             )}
                             {featureTab === 'occupancy_analysis' && (
                                 <div className="feature-pane">
-                                    <div style={{ fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'rgba(255,255,255,0.6)', marginBottom: '10px' }}>Occupancy Analysis</div>
-                                    <p className="placeholder-text">Occupancy analysis content will be added here.</p>
+                                    <p className="occupancy-tab-hint">Occupancy analysis is shown in the main view.</p>
                                 </div>
                             )}
                             {featureTab === 'threat_detection' && (
@@ -951,6 +969,12 @@ function Dashboard() {
                     </div>
                 </div>
 
+                {featureTab === 'occupancy_analysis' ? (
+                    <div className="occupancy-analysis-view">
+                        <OccupancyAnalysis />
+                    </div>
+                ) : (
+                <>
                 {/* Center Panel - Video Feed */}
                 <div className="center-panel">
                     <div className="video-controls">
@@ -1208,6 +1232,18 @@ function Dashboard() {
                                     <div className="label">Room type</div>
                                     <div className="value">{displayRoomType != null && displayRoomType !== '' ? displayRoomType.replace(/_/g, ' ') : '—'}</div>
                                 </div>
+                                <div className="system-status-card">
+                                    <div className="label">Motion score</div>
+                                    <div className="value">{motionScore !== null && motionScore !== undefined ? Number(motionScore).toFixed(4) : '—'}</div>
+                                </div>
+                                <div className="system-status-card">
+                                    <div className="label">Brightness score</div>
+                                    <div className="value">{brightnessScore !== null && brightnessScore !== undefined ? Number(brightnessScore).toFixed(2) : '—'}</div>
+                                </div>
+                                <div className="system-status-card">
+                                    <div className="label">Model (by motion)</div>
+                                    <div className="value">{modelFromMotion ? `${modelFromMotion.mode} (${modelFromMotion.model})` : '—'}</div>
+                                </div>
                                 {featureTab !== 'threat_detection' && occupancyStats ? (
                                     <div className="system-status-card" style={{ gridColumn: '1 / -1' }}>
                                         <div className="label">People count</div>
@@ -1298,6 +1334,8 @@ function Dashboard() {
                         </div>
                     </div>
                 </div>
+                </>
+                )}
             </div>
         </div>
     );

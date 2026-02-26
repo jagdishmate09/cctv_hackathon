@@ -19,10 +19,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    from oracle_occupancy import parse_dav_filename, insert_occupancy_buckets
+    from oracle_occupancy import parse_dav_filename, insert_occupancy_buckets, query_occupancy_data
 except ImportError as e:
     parse_dav_filename = None
     insert_occupancy_buckets = None
+    query_occupancy_data = None
     print(f"[DB] Oracle occupancy not loaded (oracledb?): {e}", flush=True)
 
 # Microsoft SSO (OAuth 2.0) config from env
@@ -206,6 +207,56 @@ def health():
         'service': 'backend',
         'detector_ready': detector is not None
     })
+
+
+@app.route('/api/occupancy', methods=['GET'])
+def get_occupancy():
+    """
+    GET /api/occupancy?camera_number=&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&limit=5000
+    Returns occupancy records from OCCUPANCY_DATA for charts. When Oracle is not configured, returns empty data.
+    """
+    if query_occupancy_data is None:
+        return jsonify({
+            'success': True,
+            'data': [],
+            'by_date': [],
+            'by_camera': [],
+            'message': 'Occupancy database not configured'
+        })
+    camera_number = request.args.get('camera_number') or None
+    date_from = request.args.get('date_from') or None
+    date_to = request.args.get('date_to') or None
+    try:
+        limit = min(int(request.args.get('limit', 5000)), 10000)
+    except ValueError:
+        limit = 5000
+    rows, err = query_occupancy_data(
+        camera_number=camera_number,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    if err:
+        return jsonify({'success': False, 'error': err, 'data': [], 'by_date': [], 'by_camera': []}), 500
+    # Aggregate for charts: by_date (date -> total people / count), by_camera (camera -> avg or max)
+    by_date = {}
+    by_camera = {}
+    for r in rows:
+        dt = r.get('occupancy_date')
+        cam = r.get('camera_number') or 'Unknown'
+        n = r.get('no_of_people', 0)
+        if dt:
+            by_date[dt] = by_date.get(dt, []) + [n]
+        by_camera[cam] = by_camera.get(cam, []) + [n]
+    by_date_list = [{'date': k, 'max_people': max(v), 'avg_people': round(sum(v) / len(v), 1), 'samples': len(v)} for k, v in sorted(by_date.items())]
+    by_camera_list = [{'camera_number': k, 'max_people': max(v), 'avg_people': round(sum(v) / len(v), 1), 'samples': len(v)} for k, v in sorted(by_camera.items())]
+    return jsonify({
+        'success': True,
+        'data': rows,
+        'by_date': by_date_list,
+        'by_camera': by_camera_list,
+    })
+
 
 @app.route('/api/detect', methods=['POST'])
 def detect_people():
@@ -427,6 +478,14 @@ def _is_room_lighted(frame, threshold=45):
         return None
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return float(gray.mean()) >= threshold
+
+
+def _brightness_score(frame):
+    """Return mean luminance (0-255) using OpenCV for display only. None if no frame."""
+    if frame is None or frame.size == 0:
+        return None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return round(float(gray.mean()), 2)
 
 
 _camera_mapping_cache = None
@@ -718,6 +777,22 @@ def _stream_dav_frames():
             video_processor = AgenticVideoProcessor(camera_id=stream_camera_id)
             start_ts = datetime.utcnow()
 
+        # Motion score for display only (backend_new logic) - always compute so frontend can show it
+        motion_for_display = None
+        try:
+            from agentic.vision.motion import MotionDetector as MotionDetectorClass, MotionConfig as MotionConfigClass
+            motion_for_display = MotionDetectorClass(MotionConfigClass(min_changed_fraction=0.01))
+        except Exception:
+            try:
+                import sys
+                _backend_new = Path(__file__).resolve().parent.parent / "backend_new" / "src"
+                if str(_backend_new) not in sys.path:
+                    sys.path.insert(0, str(_backend_new))
+                from vision.motion import MotionDetector as MotionDetectorClass, MotionConfig as MotionConfigClass
+                motion_for_display = MotionDetectorClass(MotionConfigClass(min_changed_fraction=0.01))
+            except Exception:
+                motion_for_display = None
+
         while frames_processed < max_frames:
             ret, frame = cap.read()
             if not ret:
@@ -775,12 +850,18 @@ def _stream_dav_frames():
                 'frame_width': fw,
                 'frame_height': fh,
                 'room_lighted': _is_room_lighted(frame),
+                'brightness_score': _brightness_score(frame),
             }
-            if use_agentic_video and out.get('mode') is not None:
-                payload['agent_mode'] = out['mode']
-                payload['presence_seconds'] = out.get('presence_seconds')
-                if out.get('alert'):
-                    payload['alert'] = out['alert']
+            if use_agentic_video:
+                if out.get('mode') is not None:
+                    payload['agent_mode'] = out['mode']
+                    payload['presence_seconds'] = out.get('presence_seconds')
+                    if out.get('alert'):
+                        payload['alert'] = out['alert']
+                if out.get('motion_score') is not None:
+                    payload['motion_score'] = out['motion_score']
+            if payload.get('motion_score') is None and motion_for_display is not None:
+                payload['motion_score'] = round(motion_for_display.score(frame), 4)
             # Include parsed filename info for frontend (camera name, video date/time, room type)
             if parsed_filename:
                 h, m, s = parsed_filename['start_hour'], parsed_filename['start_min'], parsed_filename['start_sec']

@@ -146,6 +146,72 @@ def insert_occupancy_buckets(
         return False, str(e)
 
 
+def query_occupancy_data(
+    camera_number: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 5000,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Query OCCUPANCY_DATA from Oracle. Returns (list of rows as dicts, error_message).
+    Each row: camera_number, occupancy_date (YYYY-MM-DD), occupancy_time, no_of_people, created_at.
+    """
+    url = os.environ.get("ORACLE_URL")
+    user = os.environ.get("ORACLE_USERNAME")
+    password = os.environ.get("ORACLE_PASSWORD")
+    if not all([url, user, password]):
+        return [], "Oracle credentials not configured"
+    try:
+        import oracledb
+    except ImportError:
+        return [], "oracledb not installed"
+
+    conditions = ["1=1"]
+    params = {"lim": limit}
+    if camera_number:
+        conditions.append("CAMERA_NUMBER = :cam")
+        params["cam"] = camera_number
+    if date_from:
+        conditions.append("OCCUPANCY_DATE >= TO_DATE(:dt_from, 'YYYY-MM-DD')")
+        params["dt_from"] = date_from
+    if date_to:
+        conditions.append("OCCUPANCY_DATE <= TO_DATE(:dt_to, 'YYYY-MM-DD')")
+        params["dt_to"] = date_to
+
+    sql = f"""
+        SELECT CAMERA_NUMBER, OCCUPANCY_DATE, OCCUPANCY_TIME, NO_OF_PEOPLE, CREATED_AT
+        FROM OCCUPANCY_DATA
+        WHERE {" AND ".join(conditions)}
+        ORDER BY OCCUPANCY_DATE, OCCUPANCY_TIME, CAMERA_NUMBER
+        FETCH FIRST :lim ROWS ONLY
+    """
+    try:
+        conn = oracledb.connect(user=user, password=password, dsn=url)
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        col_names = [c[0] for c in cur.description]
+        result = []
+        for r in rows:
+            d = dict(zip(col_names, r))
+            if d.get("OCCUPANCY_DATE"):
+                d["occupancy_date"] = d["OCCUPANCY_DATE"].strftime("%Y-%m-%d") if hasattr(d["OCCUPANCY_DATE"], "strftime") else str(d["OCCUPANCY_DATE"])[:10]
+            if d.get("CREATED_AT"):
+                d["created_at"] = d["CREATED_AT"].isoformat() if hasattr(d["CREATED_AT"], "isoformat") else str(d["CREATED_AT"])
+            result.append({
+                "camera_number": d.get("CAMERA_NUMBER"),
+                "occupancy_date": d.get("occupancy_date") or d.get("OCCUPANCY_DATE"),
+                "occupancy_time": d.get("OCCUPANCY_TIME"),
+                "no_of_people": int(d.get("NO_OF_PEOPLE", 0)),
+                "created_at": d.get("created_at") or d.get("CREATED_AT"),
+            })
+        cur.close()
+        conn.close()
+        return result, None
+    except Exception as e:
+        return [], str(e)
+
+
 def insert_test_row() -> Tuple[bool, Optional[str]]:
     """
     Insert a single test row into OCCUPANCY_DATA (same table) with current timestamp.

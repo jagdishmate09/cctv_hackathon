@@ -42,6 +42,26 @@
     color: var(--text-primary);
 }
 
+.login-logo-wrap {
+    background: rgba(102, 126, 234, 0.14);
+    padding: 20px;
+    margin: 0 auto 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: fit-content;
+    border-radius: 50%;
+}
+
+.login-team-logo {
+    display: block;
+    width: 100px;
+    height: 100px;
+    margin: 0;
+    object-fit: cover;
+    border-radius: 50%;
+}
+
 .login-container {
     width: 100%;
     max-width: 440px;
@@ -65,7 +85,7 @@
     display: flex;
     justify-content: center;
     align-items: center;
-    background: rgba(255, 255, 255, 0.95);
+    background: rgba(245, 245, 247, 0.98);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     border-radius: 20px;
@@ -683,6 +703,16 @@
 
 /* Responsive Design */
 @media (max-width: 968px) {
+    .login-logo-wrap {
+        padding: 16px;
+        margin-bottom: 16px;
+    }
+
+    .login-team-logo {
+        width: 88px;
+        height: 88px;
+    }
+
     .login-page-wrapper {
         justify-content: center;
         padding: 20px;
@@ -703,6 +733,16 @@
 }
 
 @media (max-width: 480px) {
+    .login-logo-wrap {
+        padding: 12px;
+        margin-bottom: 12px;
+    }
+
+    .login-team-logo {
+        width: 72px;
+        height: 72px;
+    }
+
     .login-page-wrapper {
         padding: 10px;
         justify-content: center;

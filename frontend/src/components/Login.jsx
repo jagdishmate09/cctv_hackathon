@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { API_BASE } from '../api';
 import '../styles/login.css';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
 function Login() {
     const navigate = useNavigate();
@@ -34,8 +33,11 @@ function Login() {
                 <div className="login-wrapper">
                     <div className="login-right">
                         <div className="login-form-container">
+                            <div className="login-logo-wrap">
+                                <img src="/images/team_logo.jpg" alt="Team logo" className="login-team-logo" />
+                            </div>
                             <div className="container-title">
-                                <h1>IntelliSpace AI</h1>
+                                <h1>VisionForge AI</h1>
                             </div>
                             <div className="login-form sso-only">
                                 <p className="login-subtitle">Sign in with your Microsoft account</p>

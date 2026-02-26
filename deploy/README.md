@@ -35,9 +35,11 @@ Login requires Azure AD. In `backend/.env` set:
 - `MICROSOFT_CLIENT_ID`
 - `MICROSOFT_CLIENT_SECRET`
 - `MICROSOFT_TENANT_ID`
-- `REDIRECT_URI=http://YOUR_SERVER_IP/auth/microsoft/callback`
-- `FRONTEND_URL=http://YOUR_SERVER_IP`
+- `REDIRECT_URI` – must match exactly what you register in Azure; use your **backend** callback URL (e.g. `https://freeze-example-address-ashley.trycloudflare.com/auth/microsoft/callback` if that host proxies `/auth` to the backend)
+- `FRONTEND_URL` – base URL of the frontend (e.g. `https://freeze-example-address-ashley.trycloudflare.com`)
 - `SECRET_KEY` (strong random value)
 
-In Azure Portal → App registration → Authentication, add redirect URI:  
-`http://YOUR_SERVER_IP/auth/microsoft/callback`
+**Azure Portal:** App registration → Authentication → Add a redirect URI:
+
+- For Cloudflare tunnel: `https://freeze-example-address-ashley.trycloudflare.com/auth/microsoft/callback`
+- For server IP: `http://YOUR_SERVER_IP/auth/microsoft/callback`
